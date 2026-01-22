@@ -36,6 +36,7 @@ class SelectionPolicy:
         deny_vendors: Set of vendor names to deny
         allow_vendors: Set of vendor names to allow (whitelist)
     """
+
     prefer: str = PREFER_DEFAULT
     strict: bool = False
     per_op_order: Tuple[Tuple[str, Tuple[str, ...]], ...] = field(default_factory=tuple)
@@ -61,9 +62,7 @@ class SelectionPolicy:
         """Create a SelectionPolicy from dictionary-like arguments."""
         per_op_tuple = tuple()
         if per_op_order:
-            per_op_tuple = tuple(
-                (k, tuple(v)) for k, v in sorted(per_op_order.items())
-            )
+            per_op_tuple = tuple((k, tuple(v)) for k, v in sorted(per_op_order.items()))
 
         return cls(
             prefer=prefer.lower(),
@@ -116,21 +115,21 @@ class SelectionPolicy:
             parts.append(f"deny={','.join(sorted(self.deny_vendors))}")
 
         if self.per_op_order:
-            per_op_str = ";".join(
-                f"{k}={'|'.join(v)}" for k, v in self.per_op_order
-            )
+            per_op_str = ";".join(f"{k}={'|'.join(v)}" for k, v in self.per_op_order)
             parts.append(f"per={per_op_str}")
 
         return ";".join(parts)
 
     def __hash__(self) -> int:
-        return hash((
-            self.prefer,
-            self.strict,
-            self.per_op_order,
-            self.deny_vendors,
-            self.allow_vendors,
-        ))
+        return hash(
+            (
+                self.prefer,
+                self.strict,
+                self.per_op_order,
+                self.deny_vendors,
+                self.allow_vendors,
+            )
+        )
 
 
 class PolicyManager:
@@ -142,11 +141,12 @@ class PolicyManager:
     - Context-local policy (using context managers)
     - Policy epoch tracking for cache invalidation
     """
+
     _instance = None
     _lock = threading.Lock()
 
     def __init__(self):
-        if hasattr(self, '_policy_epoch'):
+        if hasattr(self, "_policy_epoch"):
             return
 
         self._policy_epoch = 0
@@ -264,8 +264,13 @@ class PolicyManager:
         allow_str = os.environ.get("VLLM_FL_ALLOW_VENDORS", "").strip()
         allow_vendors = self._parse_csv_set(allow_str) if allow_str else None
 
+        # TODO(xinan): remove this
+        per_op_order = {"attention_backend": ["vendor", "reference", "flaggems"]}
+
         per_op_str = os.environ.get("VLLM_FL_PER_OP", "").strip()
-        per_op_order = self._parse_per_op(per_op_str) if per_op_str else None
+        env_per_op = self._parse_per_op(per_op_str) if per_op_str else None
+        if env_per_op:
+            per_op_order.update(env_per_op)
 
         return SelectionPolicy.from_dict(
             prefer=prefer_str,

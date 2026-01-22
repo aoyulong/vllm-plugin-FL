@@ -18,24 +18,3 @@ repos:
   hooks:
   - id: typos
     args: [--force-exclude]
-# - repo: https://github.com/pre-commit/mirrors-mypy
-#   rev: v1.11.1
-#   hooks:
-#     - id: mypy
-#       args: [--python-version=3.10]
-#       additional_dependencies:
-#         - regex
-#         - types-cachetools
-#         - types-setuptools
-#         - types-PyYAML
-#         - types-requests
-#         - types-torch
-#         - pydantic
-
-# -   repo: local
-#     hooks:
-#     -   id: check-header
-#         name: check-header
-#         entry: python ./tools/codestyle/check_header.py
-#         language: python
-#         types: [python]

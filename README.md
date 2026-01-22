@@ -45,7 +45,7 @@ A vLLM plugin built on the FlagOS unified multi-chip backend.
     export FLAGCX_PATH="$PWD"
     ```
 
-    3.4 Installation FlagCX
+    2.4 Installation FlagCX
     ```sh
     cd plugin/torch/
     python setup.py develop --adaptor nvidia/ascend
