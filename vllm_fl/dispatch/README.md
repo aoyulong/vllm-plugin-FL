@@ -18,9 +18,29 @@ dispatch/
 └── backends/                # Backend implementations
     ├── base.py              # Backend abstract base class
     ├── flaggems/            # FlagGems backend (DEFAULT, priority 150)
+    │   ├── flaggems.py      # Backend class
+    │   ├── register_ops.py  # Registration function
+    │   └── impl/            # Operator implementations
+    │       ├── activation.py
+    │       ├── normalization.py
+    │       ├── rotary.py
+    │       ├── attention.py       # AttentionFLBackend, AttentionFLImpl
+    │       ├── mla.py             # MLAFLBackend, MLAFLImpl
+    │       └── custom_attention.py # Attention backend registration
     ├── reference/           # Reference backend (PyTorch, priority 50)
     └── vendor/              # Vendor-specific backends (priority 100)
-        └── ascend/          # Example: Huawei Ascend backend
+        ├── cuda/            # NVIDIA CUDA backend
+        │   └── impl/
+        │       ├── activation.py
+        │       ├── normalization.py
+        │       └── rotary.py
+        └── ascend/          # Huawei Ascend NPU backend
+            └── impl/
+                ├── activation.py
+                ├── normalization.py
+                ├── rotary.py
+                ├── attention.py       # AscendAttentionBackend
+                └── attention_mask.py  # Attention mask utilities
 ```
 
 ## Core Concepts
@@ -170,10 +190,82 @@ result = fn(query, key, cos, sin, position_ids)
 result = manager.call("silu_and_mul", x)
 ```
 
-## Environment Variables
+## Configuration
+
+The dispatch system supports two ways to configure backend selection:
+1. **Configuration file (YAML)** - Recommended for complex configurations
+2. **Environment variables** - Simple, quick configuration
+
+**Priority**: Configuration file > Environment variables > Default values
+
+### Configuration File (YAML)
+
+Set the `VLLM_FL_CONFIG` environment variable to specify a YAML configuration file:
+
+```bash
+export VLLM_FL_CONFIG=/path/to/vllm_fl_dispatch.yaml
+```
+
+#### Example Configuration File
+
+```yaml
+# vllm_fl_dispatch.yaml
+
+# Preferred backend type: flaggems, vendor, or reference
+prefer: vendor
+
+# Strict mode:
+#   true  = fail immediately on error, no fallback
+#   false = try next backend on failure (default)
+strict: false
+
+# Vendor whitelist (optional)
+allow_vendors:
+  - cuda
+
+# Vendor blacklist (optional)
+deny_vendors:
+  - ascend
+
+# Per-operator backend selection order (optional)
+# Only the backends listed will be tried, in the specified order.
+# If you only list 2 options, only those 2 will be attempted.
+#
+# Supported tokens:
+#   - flaggems      : FlagGems default implementation
+#   - reference     : PyTorch reference implementation
+#   - vendor        : Any available vendor backend (auto-detect)
+#   - vendor:cuda   : Only CUDA vendor backend
+#   - vendor:ascend : Only Ascend vendor backend
+op_backends:
+  rmsnorm:
+    - vendor        # Try any available vendor first
+    - flaggems      # Then try flaggems
+    # reference not listed, so it won't be used for rmsnorm
+
+  silu_and_mul:
+    - vendor:cuda   # Only try CUDA, not other vendors
+    - flaggems
+    - reference
+```
+
+#### Token Types Explained
+
+| Token | Description |
+|-------|-------------|
+| `flaggems` | FlagGems default implementation |
+| `reference` | PyTorch reference implementation |
+| `vendor` | Any available vendor backend (auto-detects hardware) |
+| `vendor:cuda` | Only CUDA vendor backend |
+| `vendor:ascend` | Only Ascend vendor backend |
+
+**Note**: When using `vendor` (without specifying a vendor name), the system automatically selects an available vendor backend based on hardware detection.
+
+### Environment Variables
 
 | Variable | Description | Example | Behavior |
 |----------|-------------|---------|----------|
+| `VLLM_FL_CONFIG` | Path to YAML config file | `/path/to/config.yaml` | Highest priority, overrides other env vars |
 | `VLLM_FL_PREFER` | Preferred backend (sets selection order) | `flaggems`, `vendor`, `reference` | Defines priority order, falls back if unavailable |
 | `VLLM_FL_STRICT` | Enable strict mode (auto-fallback on failure) | `1` or `0` | When `1`, tries alternatives if primary fails |
 | `VLLM_FL_DENY_VENDORS` | Denied vendors list (blacklist) | `vendor1,vendor2` | Excludes specified vendors from selection |
@@ -204,15 +296,16 @@ export VLLM_FL_PLUGIN_MODULES=my_custom_backend
 export VLLM_FL_LOG_LEVEL=DEBUG
 ```
 
-### Environment Variable Priority
+### Configuration Priority
 
-The dispatch system applies environment variables in the following order:
+The dispatch system applies configuration in the following order:
 
-1. **`VLLM_FL_PER_OP`** - Highest priority, overrides default order for specific operators
-2. **`VLLM_FL_ALLOW_VENDORS`** - Whitelist filter (if set, only these vendors are allowed)
-3. **`VLLM_FL_DENY_VENDORS`** - Blacklist filter (these vendors are excluded)
-4. **`VLLM_FL_PREFER`** - Default selection order for all operators
-5. **`BackendPriority`** - Code-defined priority (used for tie-breaking within same kind)
+1. **`VLLM_FL_CONFIG`** - Highest priority, YAML config file overrides all environment variables
+2. **`VLLM_FL_PER_OP`** - Per-operator order overrides default order for specific operators
+3. **`VLLM_FL_ALLOW_VENDORS`** - Whitelist filter (if set, only these vendors are allowed)
+4. **`VLLM_FL_DENY_VENDORS`** - Blacklist filter (these vendors are excluded)
+5. **`VLLM_FL_PREFER`** - Default selection order for all operators
+6. **`BackendPriority`** - Code-defined priority (used for tie-breaking within same kind)
 
 **Priority values are spaced by 50 to allow future insertion of intermediate priorities:**
 - `BackendPriority.DEFAULT` = 150 (FlagGems)
@@ -271,6 +364,7 @@ Currently supported operators:
 | `silu_and_mul` | SiLU activation + element-wise multiplication | ✓ | ✓ | ✓ |
 | `rmsnorm` | RMS normalization | ✓ | ✓ | ✓ |
 | `rotary_embedding` | Rotary position embedding | ✓ | ✓ | ✓ |
+| `attention_backend` | Attention backend class path | ✓ | - | ✓ |
 
 ## Selection Process
 
@@ -299,10 +393,15 @@ When adding a new operator, modify these files:
 - `backends/flaggems/impl/*.py` - Add FlagGems implementation
 - `backends/flaggems/flaggems.py` - Add method to backend class
 - `backends/flaggems/register_ops.py` - Register OpImpl
-- `backends/reference/impl/*.py` - Add PyTorch implementation
+- `backends/reference/impl/*.py` - Add PyTorch implementation (if applicable)
 - `backends/reference/reference.py` - Add method to backend class
 - `backends/reference/register_ops.py` - Register OpImpl
+- `backends/vendor/<vendor>/impl/*.py` - Add vendor-specific implementation (optional)
+- `backends/vendor/<vendor>/<vendor>.py` - Add method to vendor backend class
+- `backends/vendor/<vendor>/register_ops.py` - Register vendor OpImpl
 - `ops.py` - Add abstract method declaration
+
+**Note:** Not all operators require a reference implementation. For example, `attention_backend` only has FlagGems and vendor implementations since it returns a backend class path rather than executing a computation.
 
 ### Adding Vendor Backends
 
@@ -324,7 +423,8 @@ backends/vendor/<vendor_name>/
     ├── __init__.py
     ├── activation.py
     ├── normalization.py
-    └── rotary.py
+    ├── rotary.py
+    └── attention.py        # (optional) Vendor-specific attention backend
 ```
 
 **Step 1: Create Backend Class** (`<vendor_name>.py`):
@@ -456,8 +556,14 @@ export VLLM_FL_LOG_LEVEL=DEBUG
 - [ ] `impl_id` follows format: `vendor.<vendor_name>`
 - [ ] Priority set to `BackendPriority.VENDOR` (100)
 - [ ] Error handling for missing dependencies
+- [ ] (Optional) `attention_backend()` returns vendor-specific attention backend class path
 
 #### Current Vendor Backends
+
+| Vendor | Device | Library | Attention Backend |
+|--------|--------|---------|-------------------|
+| `cuda` | NVIDIA GPU | `vllm._custom_ops` | - (uses vLLM native) |
+| `ascend` | Huawei NPU | `torch_npu` | `AscendAttentionBackend` |
 
 See `backends/vendor/template/` for a template to create new vendor backends.
 
@@ -481,6 +587,7 @@ OpManager supports multi-process environments:
 - `set_global_policy(policy)`: Set global policy
 - `reset_global_policy()`: Reset to environment variable defaults
 - `policy_context(policy)`: Temporary policy context
+- `policy_from_config(config_path)`: Create policy from YAML config file
 
 ### Manager
 

@@ -10,7 +10,7 @@ import logging
 import os
 import threading
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Set, Tuple
 
 from .registry import OpRegistry
 from .policy import SelectionPolicy, get_policy
@@ -48,6 +48,7 @@ class OpManager:
         self._state = _OpManagerState()
         self._dispatch_cache: Dict[Tuple[str, str, int], Callable] = {}
         self._called_ops: Dict[str, str] = {}  # Map op_name -> last_used_impl_id
+        self._failed_impls: Dict[str, Set[str]] = {}  # Map op_name -> set of failed impl_ids
 
         # Register at_fork handler for multi-process safety
         try:
@@ -69,6 +70,7 @@ class OpManager:
             self._state.policy_epoch += 1
             self._dispatch_cache.clear()
             self._called_ops.clear()
+            self._failed_impls.clear()
             logger.debug("OpManager reset after fork")
 
     def bump_policy_epoch(self) -> None:
@@ -80,7 +82,44 @@ class OpManager:
         with self._lock:
             self._state.policy_epoch += 1
             self._dispatch_cache.clear()
+            self._failed_impls.clear()
             logger.debug(f"Policy epoch bumped to {self._state.policy_epoch}")
+
+    def clear_failed_impls(self, op_name: Optional[str] = None) -> None:
+        """
+        Clear the failed implementations cache.
+
+        This allows previously failed implementations to be retried.
+
+        Args:
+            op_name: If specified, only clear failed impls for this operator.
+                     If None, clear all failed impls.
+        """
+        with self._lock:
+            if op_name is None:
+                self._failed_impls.clear()
+                logger.debug("Cleared all failed implementations cache")
+            elif op_name in self._failed_impls:
+                del self._failed_impls[op_name]
+                logger.debug(f"Cleared failed implementations cache for op '{op_name}'")
+
+    def get_failed_impls(self, op_name: Optional[str] = None) -> Dict[str, Set[str]]:
+        """
+        Get the failed implementations cache.
+
+        Args:
+            op_name: If specified, return failed impls only for this operator.
+
+        Returns:
+            Dict mapping op_name to set of failed impl_ids.
+        """
+        with self._lock:
+            if op_name is None:
+                return {k: v.copy() for k, v in self._failed_impls.items()}
+            elif op_name in self._failed_impls:
+                return {op_name: self._failed_impls[op_name].copy()}
+            else:
+                return {}
 
     def ensure_initialized(self) -> None:
         """
@@ -406,7 +445,22 @@ class OpManager:
         candidates = self.resolve_candidates(op_name)
         last_error = None
 
-        for idx, impl in enumerate(candidates):
+        # Get failed implementations for this op (skip them)
+        failed_impl_ids = self._failed_impls.get(op_name, set())
+
+        # Filter out failed implementations
+        available_candidates = [
+            impl for impl in candidates if impl.impl_id not in failed_impl_ids
+        ]
+
+        if not available_candidates:
+            # All implementations have failed before, raise error
+            raise RuntimeError(
+                f"All implementations for op='{op_name}' have failed previously. "
+                f"Failed impl_ids: {failed_impl_ids}"
+            )
+
+        for idx, impl in enumerate(available_candidates):
             try:
                 # Log primary implementation or fallback attempts
                 if idx == 0:
@@ -444,7 +498,13 @@ class OpManager:
 
             except Exception as e:
                 last_error = e
-                if idx < len(candidates) - 1:
+                # Mark this implementation as failed
+                with self._lock:
+                    if op_name not in self._failed_impls:
+                        self._failed_impls[op_name] = set()
+                    self._failed_impls[op_name].add(impl.impl_id)
+
+                if idx < len(available_candidates) - 1:
                     # Not the last candidate, log warning and try next
                     logger.warning(
                         f"Implementation '{impl.impl_id}' failed for op '{op_name}': {e}"
@@ -457,7 +517,7 @@ class OpManager:
 
         # All implementations failed
         raise RuntimeError(
-            f"All {len(candidates)} implementation(s) failed for op='{op_name}'. "
+            f"All {len(available_candidates)} implementation(s) failed for op='{op_name}'. "
             f"Last error: {last_error}"
         ) from last_error
 

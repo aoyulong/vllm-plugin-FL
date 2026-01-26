@@ -19,6 +19,7 @@ Usage:
     result = fn(x, residual, weight, epsilon)
 
 Environment Variables:
+    VLLM_FL_CONFIG: Path to YAML configuration file (highest priority, overrides env vars)
     VLLM_FL_PREFER: Preferred backend ("flaggems", "vendor", "reference")
     VLLM_FL_STRICT: Enable strict mode ("1" or "0")
     VLLM_FL_DENY_VENDORS: Comma-separated list of denied vendors
@@ -30,6 +31,49 @@ Environment Variables:
         When enabled, prints:
         - Detailed list of registered operators and implementations at initialization
         - Selected backend for each operator call
+
+Configuration File (YAML):
+    When VLLM_FL_CONFIG is set, the dispatch system loads configuration from the
+    specified YAML file. Example:
+
+        # vllm_fl_dispatch.yaml
+
+        # Preferred backend type: flaggems, vendor, or reference
+        prefer: vendor
+
+        # Strict mode:
+        #   true  = fail immediately on error, no fallback
+        #   false = try next backend on failure (default)
+        strict: true
+
+        # Vendor whitelist (optional)
+        allow_vendors:
+          - cuda
+
+        # Vendor blacklist (optional)
+        deny_vendors:
+          - ascend
+
+        # Per-operator backend selection order (optional)
+        # Only the backends listed will be tried, in the specified order.
+        # If you only list 2 options, only those 2 will be attempted.
+        #
+        # Supported tokens:
+        #   - flaggems      : FlagGems default implementation
+        #   - reference     : PyTorch reference implementation
+        #   - vendor        : Any available vendor backend (auto-detect)
+        #   - vendor:cuda   : Only CUDA vendor backend
+        #   - vendor:ascend : Only Ascend vendor backend
+        op_backends:
+          rmsnorm:
+            - vendor        # Try any available vendor first
+            - flaggems      # Then try flaggems
+            # reference not listed, so it won't be used
+
+          silu_and_mul:
+            - vendor:cuda   # Only try CUDA, not other vendors
+            - flaggems
+            - reference
 """
 
 from .types import OpImpl, BackendImplKind, BackendPriority, match_token
@@ -41,6 +85,7 @@ from .policy import (
     set_global_policy,
     reset_global_policy,
     policy_context,
+    policy_from_config,
     with_strict_mode,
     with_preference,
     with_allowed_vendors,
@@ -104,6 +149,7 @@ __all__ = [
     "set_global_policy",
     "reset_global_policy",
     "policy_context",
+    "policy_from_config",
     "with_strict_mode",
     "with_preference",
     "with_allowed_vendors",
