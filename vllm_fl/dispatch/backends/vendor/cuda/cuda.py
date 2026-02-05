@@ -117,8 +117,5 @@ class CudaBackend(Backend):
         if use_mla:
             return AttentionBackendEnum.MLA.get_path()
 
-        # Use TRITON_ATTN when use_flaggems_op allows (e.g. USE_FLAGGEMS=1 / whitelist)
-        if use_flaggems_op("triton_attn"):
-            return AttentionBackendEnum.TRITON_ATTN.get_path()
         # Default to FLASH_ATTN
         return AttentionBackendEnum.FLASH_ATTN.get_path()

@@ -15,6 +15,10 @@ dispatch/
 ├── ops.py                   # Backend base interface
 ├── discovery.py             # Plugin discovery mechanism
 ├── logger_manager.py        # Centralized logging configuration
+├── config/                  # Platform-specific configurations
+│   ├── __init__.py          # Config loader module
+│   ├── ascend.yaml          # Ascend NPU default configuration
+│   └── cuda.yaml            # CUDA default configuration
 └── backends/                # Backend implementations
     ├── base.py              # Backend abstract base class
     ├── flaggems/            # FlagGems backend (DEFAULT, priority 150)
@@ -192,15 +196,49 @@ result = manager.call("silu_and_mul", x)
 
 ## Configuration
 
-The dispatch system supports two ways to configure backend selection:
-1. **Configuration file (YAML)** - Recommended for complex configurations
-2. **Environment variables** - Simple, quick configuration
+The dispatch system supports multiple ways to configure backend selection:
+1. **User-specified configuration file (YAML)** - Complete override
+2. **Environment variables** - Override specific items
+3. **Platform-specific configuration file** - Auto-detected defaults
+4. **Built-in default values**
 
-**Priority**: Configuration file > Environment variables > Default values
+### Configuration Priority
 
-### Configuration File (YAML)
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Configuration Priority                        │
+│                  (Highest to Lowest)                             │
+├─────────────────────────────────────────────────────────────────┤
+│  1. VLLM_FL_CONFIG        │ User config file, complete override │
+│  2. Environment Variables │ Override specific items              │
+│  3. Platform Config File  │ ascend.yaml / cuda.yaml defaults     │
+│  4. Built-in Defaults     │ Code-defined default values          │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-Set the `VLLM_FL_CONFIG` environment variable to specify a YAML configuration file:
+**Key Points:**
+- Environment variables can override specific items from platform config
+- If user doesn't set any environment variable, platform config is used
+- Users can also modify platform config files directly
+
+### Platform-Specific Configuration
+
+The system automatically detects hardware and loads the corresponding configuration file from `config/` directory:
+
+| Platform | Config File | Auto-Detection |
+|----------|-------------|----------------|
+| Ascend NPU | `config/ascend.yaml` | `torch.npu.is_available()` |
+| NVIDIA GPU | `config/cuda.yaml` | `torch.cuda.is_available()` |
+
+You can force a specific platform using `VLLM_FL_PLATFORM` environment variable:
+```bash
+export VLLM_FL_PLATFORM=ascend  # Force Ascend config
+export VLLM_FL_PLATFORM=cuda    # Force CUDA config
+```
+
+### User-Specified Configuration File (YAML)
+
+Set the `VLLM_FL_CONFIG` environment variable to specify a YAML configuration file that completely overrides all other settings:
 
 ```bash
 export VLLM_FL_CONFIG=/path/to/vllm_fl_dispatch.yaml
@@ -229,14 +267,6 @@ deny_vendors:
 
 # Per-operator backend selection order (optional)
 # Only the backends listed will be tried, in the specified order.
-# If you only list 2 options, only those 2 will be attempted.
-#
-# Supported tokens:
-#   - flagos        : FlagOS default implementation
-#   - reference     : PyTorch reference implementation
-#   - vendor        : Any available vendor backend (auto-detect)
-#   - vendor:cuda   : Only CUDA vendor backend
-#   - vendor:ascend : Only Ascend vendor backend
 op_backends:
   rms_norm:
     - vendor        # Try any available vendor first
@@ -247,6 +277,18 @@ op_backends:
     - vendor:cuda   # Only try CUDA, not other vendors
     - flagos
     - reference
+
+# FlagGems operator blacklist (optional)
+# These operators will NOT use FlagGems implementation
+flagos_blacklist:
+  - to_copy
+  - zeros
+  - mm
+
+# OOT operator blacklist (optional)
+# These operators will NOT be registered as OOT replacements
+oot_blacklist:
+  - fused_moe
 ```
 
 #### Token Types Explained
@@ -264,39 +306,92 @@ op_backends:
 <a id="environment-variables"></a>
 ### Environment Variables
 
-| Variable | Description | Example | Behavior |
-|----------|-------------|---------|----------|
-| `VLLM_FL_CONFIG` | Path to YAML config file | `/path/to/config.yaml` | Highest priority, overrides other env vars |
-| `VLLM_FL_PREFER` | Preferred backend (sets selection order) | `flagos`, `vendor`, `reference` | Defines priority order, falls back if unavailable |
-| `VLLM_FL_PREFER_ENABLED` | Global backend switch | `true` or `false` | Default `true`, `false` disables all backends to keep native vllm |
-| `VLLM_FL_FLAGOS_WHITELIST` | FlagGems ops to enable | `silu_and_mul,rms_norm` | Only these ops are enabled |
-| `VLLM_FL_FLAGOS_BLACKLIST` | FlagGems ops to disable | `rotary_embedding` | Disabled even if otherwise selected |
-| `VLLM_FL_STRICT` | Enable strict mode (auto-fallback on failure) | `1` or `0` | When `1`, tries alternatives if primary fails |
-| `VLLM_FL_DENY_VENDORS` | Denied vendors list (blacklist) | `vendor1,vendor2` | Excludes specified vendors from selection |
-| `VLLM_FL_ALLOW_VENDORS` | Allowed vendors whitelist | `vendor1,vendor2` | Only allows specified vendors (if set) |
-| `VLLM_FL_PER_OP` | Per-operator selection order | `op1=a\|b\|c;op2=x\|y` | Overrides default order for specific ops |
-| `VLLM_FL_PLUGIN_MODULES` | Plugin modules to load | `my_plugin,another_plugin` | Loads external plugin modules |
-| `VLLM_FL_LOG_LEVEL` | Log level | `DEBUG`, `INFO`, `WARNING`, `ERROR` | Controls logging verbosity |
+Environment variables can override specific items from platform config. If not set, values from platform config file are used.
+
+#### Core Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VLLM_FL_PREFER_ENABLED` | `true` | Global switch. Set `false` to disable all dispatch features |
+| `VLLM_FL_CONFIG` | (none) | Path to YAML config file (complete override) |
+| `VLLM_FL_PLATFORM` | (auto) | Force platform: `ascend`, `cuda` |
+
+#### Backend Selection
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VLLM_FL_PREFER` | `flagos` | Preferred backend: `flagos`, `vendor`, `reference` |
+| `VLLM_FL_STRICT` | `0` | Strict mode: `1` = fail on error, `0` = try fallback |
+| `VLLM_FL_PER_OP` | (none) | Per-operator order: `op1=a\|b\|c;op2=x\|y` |
+| `VLLM_FL_ALLOW_VENDORS` | (none) | Vendor whitelist, comma-separated |
+| `VLLM_FL_DENY_VENDORS` | (none) | Vendor blacklist, comma-separated |
+
+#### FlagGems Control
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `USE_FLAGGEMS` | `true` | Enable/disable FlagGems |
+| `VLLM_FL_FLAGOS_WHITELIST` | (none) | FlagGems ops whitelist (mutually exclusive with blacklist) |
+| `VLLM_FL_FLAGOS_BLACKLIST` | (none) | FlagGems ops blacklist (mutually exclusive with whitelist) |
+
+**Priority**: `WHITELIST` > `BLACKLIST` (env) > `flagos_blacklist` (config file)
+
+#### OOT Operator Control
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VLLM_FL_OOT_ENABLED` | `1` | Enable OOT operator registration |
+| `VLLM_FL_OOT_WHITELIST` | (none) | OOT ops whitelist |
+| `VLLM_FL_OOT_BLACKLIST` | (none) | OOT ops blacklist |
+
+**Priority**: `WHITELIST` > `BLACKLIST` (env) > `oot_blacklist` (config file)
+
+#### Debug & Logging
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VLLM_FL_LOG_LEVEL` | `INFO` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `VLLM_FL_DISPATCH_DEBUG` | `0` | Enable dispatch debug mode |
+
+#### Plugins
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VLLM_FL_PLUGIN_MODULES` | (none) | External plugin modules, comma-separated |
+| `VLLM_FL_OP_CONFIG` | (none) | Operator config JSON file path |
+
+#### Other
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FLAGCX_PATH` | (none) | FlagCX library path (enables FlagCX communication backend) |
+| `FLAGGEMS_ENABLE_OPLIST_PATH` | `/tmp/flaggems_enable_oplist.txt` | FlagGems enabled ops list file |
 
 ### Examples
 
 ```bash
-# Prefer FlagGems implementation
-export VLLM_FL_PREFER=flagos
+# Use platform default config (auto-detected)
+# Nothing to set - just run your application
 
-# Enable strict mode (auto-fallback on failure)
-export VLLM_FL_STRICT=1
+# Override only the prefer setting (other items from platform config)
+export VLLM_FL_PREFER=vendor
 
-# Deny specific vendors
-export VLLM_FL_DENY_VENDORS=vendor_a,vendor_b
+# Override FlagGems blacklist (overrides config file blacklist)
+export VLLM_FL_FLAGOS_BLACKLIST="mm,to_copy,zeros"
 
-# Specify selection order for specific operator
+# Use whitelist instead (completely ignores any blacklist)
+export VLLM_FL_FLAGOS_WHITELIST="silu_and_mul,rms_norm"
+
+# Specify per-operator order
 export VLLM_FL_PER_OP="rms_norm=vendor|flagos|reference"
 
-# Load external plugins
-export VLLM_FL_PLUGIN_MODULES=my_custom_backend
+# Use completely custom config file
+export VLLM_FL_CONFIG=/path/to/my_config.yaml
 
-# Set log level
+# Force specific platform
+export VLLM_FL_PLATFORM=ascend
+
+# Enable debug logging
 export VLLM_FL_LOG_LEVEL=DEBUG
 ```
 
@@ -312,39 +407,87 @@ op_backends:
     - reference
 ```
 
-### Configuration Priority
+### Configuration Priority Details
 
 The dispatch system applies configuration in the following order:
 
-1. **`VLLM_FL_CONFIG`** - Highest priority, YAML config file overrides all environment variables
-2. **`VLLM_FL_PER_OP`** - Per-operator order overrides default order for specific operators
-3. **`VLLM_FL_ALLOW_VENDORS`** - Whitelist filter (if set, only these vendors are allowed)
-4. **`VLLM_FL_DENY_VENDORS`** - Blacklist filter (these vendors are excluded)
-5. **`VLLM_FL_PREFER`** - Default selection order for all operators
-6. **`BackendPriority`** - Code-defined priority (used for tie-breaking within same kind)
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Configuration Resolution                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  VLLM_FL_CONFIG set?                                                 │
+│       │                                                               │
+│       ├── Yes ──▶ Use user config file (complete override)           │
+│       │                                                               │
+│       └── No ──▶ For each setting:                                   │
+│                       │                                               │
+│                       ├── Env var set? ──▶ Use env var value         │
+│                       │                                               │
+│                       └── Not set ──▶ Use platform config value      │
+│                                              │                        │
+│                                              └── Not found ──▶ Default│
+│                                                                       │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-**Priority values are spaced by 50 to allow future insertion of intermediate priorities:**
-- `BackendPriority.DEFAULT` = 150 (FlagGems)
-- `BackendPriority.VENDOR` = 100 (Vendor-specific)
-- `BackendPriority.REFERENCE` = 50 (PyTorch)
+#### Whitelist vs Blacklist Priority
+
+For FlagGems and OOT operators:
+
+```
+WHITELIST (env) ──▶ Completely overrides blacklist
+       │
+       └── Not set ──▶ BLACKLIST (env) ──▶ Overrides config blacklist
+                              │
+                              └── Not set ──▶ Config file blacklist
+                                                    │
+                                                    └── Not set ──▶ Allow all
+```
+
+**Important Notes:**
+- Whitelist and blacklist environment variables are mutually exclusive (error if both set)
+- If whitelist is set, it completely ignores any blacklist (env or config)
+- Environment blacklist overrides config file blacklist (not merged)
 
 #### Example: Combined Environment Variables
 
 ```bash
-export VLLM_FL_PREFER=flagos                      # Default: flagos → vendor → reference
-export VLLM_FL_DENY_VENDORS=vendor_a              # Exclude vendor_a
-export VLLM_FL_PER_OP="rms_norm=vendor|reference"  # Override for rms_norm only
+# Platform config (ascend.yaml) has:
+#   prefer: flagos
+#   flagos_blacklist: [to_copy, zeros, mm, ...]
+
+# User overrides only prefer, blacklist still from config
+export VLLM_FL_PREFER=vendor
+
+# Result:
+#   prefer: vendor (from env)
+#   flagos_blacklist: [to_copy, zeros, mm, ...] (from config)
 ```
 
-**Result:**
-- **`rms_norm` operator**: Uses `vendor → reference` order (PER_OP overrides PREFER), excluding vendor_a
-- **Other operators** (e.g., `silu_and_mul`): Uses `flagos → vendor → reference` order (from PREFER), excluding vendor_a
+```bash
+# User wants to override blacklist too
+export VLLM_FL_PREFER=vendor
+export VLLM_FL_FLAGOS_BLACKLIST="custom_op1,custom_op2"
+
+# Result:
+#   prefer: vendor (from env)
+#   flagos_blacklist: [custom_op1, custom_op2] (from env, config ignored)
+```
 
 #### Important Notes
 
-- **`VLLM_FL_PREFER` sets preference, not exclusivity**: It defines the selection order but will fall back to other backends if the preferred one is unavailable.
-- **To force a specific backend**: Combine `PREFER` with `DENY_VENDORS` or use `PER_OP` to exclude unwanted backends.
-- **`VLLM_FL_STRICT=1`**: Enables automatic fallback when the primary implementation fails at runtime (not just unavailable).
+- **Environment variables override, not merge**: Setting an env var replaces the config value entirely
+- **`VLLM_FL_PREFER` sets preference, not exclusivity**: It defines the selection order but will fall back to other backends if the preferred one is unavailable
+- **To force a specific backend**: Combine `PREFER` with `DENY_VENDORS` or use `PER_OP` to exclude unwanted backends
+- **`VLLM_FL_STRICT=1`**: Enables automatic fallback when the primary implementation fails at runtime
+
+#### Backend Priority Values
+
+Priority values are spaced by 50 to allow future insertion of intermediate priorities:
+- `BackendPriority.DEFAULT` = 150 (FlagGems)
+- `BackendPriority.VENDOR` = 100 (Vendor-specific)
+- `BackendPriority.REFERENCE` = 50 (PyTorch)
 
 ## Policy Context Management
 

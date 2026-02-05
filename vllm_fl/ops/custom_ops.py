@@ -37,12 +37,18 @@ def register_oot_ops(whitelist: Optional[List[str]] = None) -> None:
         whitelist: If provided, only register operators in this list.
                    If None, check VLLM_FL_OOT_WHITELIST env var.
                    If neither is set, register all operators.
+
+    Operators in VLLM_FL_OOT_BLACKLIST or platform config oot_blacklist
+    will be excluded from registration.
     """
-    from vllm_fl.utils import get_oot_whitelist, is_oot_enabled, use_flaggems_op
+    from vllm_fl.utils import get_oot_blacklist, get_oot_whitelist, is_oot_enabled, use_flaggems_op
 
     # Check if OOT registration is enabled
     if not is_oot_enabled():
         return
+
+    # Get blacklist (from env var or platform config)
+    blacklist = get_oot_blacklist() or []
 
     # Determine which operators to register
     env_whitelist = get_oot_whitelist()
@@ -52,6 +58,9 @@ def register_oot_ops(whitelist: Optional[List[str]] = None) -> None:
         ops_to_register = whitelist
     else:
         ops_to_register = list(OOT_OPS.keys())
+
+    # Apply blacklist
+    ops_to_register = [op for op in ops_to_register if op not in blacklist]
 
     for op_name in ops_to_register:
         if op_name not in OOT_OPS:

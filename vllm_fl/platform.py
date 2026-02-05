@@ -160,48 +160,15 @@ class PlatformFL(Platform):
 
         use_mla = attn_selector_config.use_mla
 
-        try:
-            backend_path = call_op("attention_backend", use_mla=use_mla)
+        backend_path = call_op("attention_backend", use_mla=use_mla)
 
-            logger.info_once(
-                "Using attention backend via dispatch (use_mla=%s): %s",
-                use_mla,
-                backend_path,
-                scope="local",
-            )
-            return backend_path
-
-        except RuntimeError as e:
-            # Fallback: if dispatch fails, use device-type based selection
-            logger.warning(
-                "Dispatch mechanism failed for attention_backend, "
-                "falling back to device-type based selection: %s",
-                e,
-            )
-
-            if cls.device_type == "npu":
-                if use_mla:
-                    backend_path = (
-                        "vllm_fl.dispatch.backends.flaggems.impl.mla.MLAFLBackend"
-                    )
-                else:
-                    backend_path = "vllm_fl.dispatch.backends.flaggems.impl.attention.AttentionFLBackend"
-            else:
-                # For CUDA and other devices, use vLLM native backend
-                from vllm.attention.backends.registry import AttentionBackendEnum
-
-                if use_mla:
-                    backend_path = AttentionBackendEnum.MLA.get_path()
-                else:
-                    backend_path = AttentionBackendEnum.FLASH_ATTN.get_path()
-
-            logger.info_once(
-                "Using fallback attention backend (use_mla=%s): %s",
-                use_mla,
-                backend_path,
-                scope="local",
-            )
-            return backend_path
+        logger.info_once(
+            "Using attention backend via dispatch (use_mla=%s): %s",
+            use_mla,
+            backend_path,
+            scope="local",
+        )
+        return backend_path
 
     @classmethod
     def get_supported_vit_attn_backends(cls) -> list["AttentionBackendEnum"]:

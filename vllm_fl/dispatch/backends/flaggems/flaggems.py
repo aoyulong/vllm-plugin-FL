@@ -126,6 +126,16 @@ class FlagGemsBackend(Backend):
         Returns:
             Fully qualified class path string
         """
+        from vllm.attention.backends.registry import AttentionBackendEnum
+
+        # TritonAttentionBackend requires CUDA, check if available
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "TritonAttentionBackend requires CUDA but CUDA is not available. "
+                "Falling back to vendor implementation."
+            )
+
         if use_mla:
-            return "vllm_fl.dispatch.backends.flaggems.impl.mla.MLAFLBackend"
-        return "vllm_fl.dispatch.backends.flaggems.impl.attention.AttentionFLBackend"
+            raise NotImplementedError("NOT support mla now!")
+
+        return AttentionBackendEnum.TRITON_ATTN.get_path()

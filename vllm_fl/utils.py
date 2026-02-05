@@ -23,25 +23,92 @@ def use_flaggems(default: bool = True) -> bool:
     return value.lower() in ("true", "1")
 
 
-def use_flaggems_op(op_name: str, default: bool = True) -> bool:
-    if not use_flaggems(default=default):
-        return False
+def get_flag_gems_whitelist_blacklist() -> Tuple[
+    Optional[list[str]], Optional[list[str]]
+]:
+    """
+    Get FlagGems operator whitelist and blacklist.
+
+    Priority (highest to lowest):
+    1. VLLM_FL_FLAGOS_WHITELIST env var: Only these ops use FlagGems
+    2. VLLM_FL_FLAGOS_BLACKLIST env var: These ops don't use FlagGems
+    3. Platform config flagos_blacklist: Default blacklist from config file
+
+    Note: VLLM_FL_FLAGOS_WHITELIST and VLLM_FL_FLAGOS_BLACKLIST cannot be set
+    simultaneously. If whitelist is set, it completely overrides any blacklist.
+
+    Returns:
+        Tuple[Optional[list[str]], Optional[list[str]]]:
+            A tuple of (whitelist, blacklist). Each is None if not set.
+
+    Raises:
+        ValueError: If both VLLM_FL_FLAGOS_WHITELIST and VLLM_FL_FLAGOS_BLACKLIST
+                    are set simultaneously.
+    """
     whitelist_str = os.environ.get("VLLM_FL_FLAGOS_WHITELIST", "")
     blacklist_str = os.environ.get("VLLM_FL_FLAGOS_BLACKLIST", "")
-    if not whitelist_str and not blacklist_str:
-        return True
-    whitelist = {op.strip() for op in whitelist_str.split(",") if op.strip()}
-    blacklist = {op.strip() for op in blacklist_str.split(",") if op.strip()}
-    if op_name in whitelist and op_name in blacklist:
+
+    # Check if both env vars are set (conflict)
+    if whitelist_str and blacklist_str:
         raise ValueError(
-            "VLLM_FL_FLAGOS_WHITELIST and VLLM_FL_FLAGOS_BLACKLIST both contain "
-            f"{op_name!r}. Please remove the conflict."
+            "Cannot set both VLLM_FL_FLAGOS_WHITELIST and VLLM_FL_FLAGOS_BLACKLIST "
+            "simultaneously. Please set only one of them."
         )
-    if op_name in blacklist:
+
+    whitelist = None
+    blacklist = None
+
+    # Priority 1: Whitelist from env var (completely overrides blacklist)
+    if whitelist_str:
+        whitelist = [op.strip() for op in whitelist_str.split(",") if op.strip()]
+        return whitelist, None  # Whitelist overrides any blacklist
+
+    # Priority 2: Blacklist from env var
+    if blacklist_str:
+        blacklist = [op.strip() for op in blacklist_str.split(",") if op.strip()]
+        return None, blacklist
+
+    # Priority 3: Blacklist from platform config
+    try:
+        from vllm_fl.dispatch.config import get_flagos_blacklist
+        config_blacklist = get_flagos_blacklist()
+        if config_blacklist:
+            blacklist = config_blacklist
+    except Exception:
+        pass
+
+    return whitelist, blacklist
+
+
+def use_flaggems_op(op_name: str, default: bool = True) -> bool:
+    """
+    Check if FlagGems should be used for a specific operator.
+
+    Priority (highest to lowest):
+    1. VLLM_FL_FLAGOS_WHITELIST env var: Only these ops use FlagGems
+    2. VLLM_FL_FLAGOS_BLACKLIST env var: These ops don't use FlagGems
+    3. Platform config flagos_blacklist: Default blacklist from config file
+    4. Default: Use FlagGems for all ops
+
+    Note: Whitelist and blacklist (env vars) cannot be set simultaneously.
+    If whitelist is set, it completely overrides the config file blacklist.
+    """
+    if not use_flaggems(default=default):
         return False
-    if not whitelist:
-        return True
-    return op_name in whitelist
+
+    # Get whitelist/blacklist with proper priority
+    whitelist, blacklist = get_flag_gems_whitelist_blacklist()
+
+    # If whitelist is set, only allow ops in whitelist
+    if whitelist is not None:
+        return op_name in whitelist
+
+    # If blacklist is set (from env or config), deny ops in blacklist
+    if blacklist is not None:
+        return op_name not in blacklist
+
+    # Default: allow all ops
+    return True
 
 
 def _load_op_config_from_env() -> None:
@@ -108,62 +175,6 @@ class DeviceInfo:
         return True
 
 
-def get_flag_gems_whitelist_blacklist() -> Tuple[
-    Optional[list[str]], Optional[list[str]]
-]:
-    """
-    Get FlagGems operator whitelist and blacklist from environment variables.
-
-    Reads VLLM_FL_FLAGOS_WHITELIST and VLLM_FL_FLAGOS_BLACKLIST environment variables,
-    parses comma-separated operator names, and returns them as lists.
-
-    Note: VLLM_FL_FLAGOS_WHITELIST and VLLM_FL_FLAGOS_BLACKLIST cannot be set simultaneously.
-    If both are set, a ValueError will be raised.
-
-    Returns:
-        Tuple[Optional[list[str]], Optional[list[str]]]:
-            A tuple of (whitelist, blacklist). Each is None if not set,
-            or a list of operator names (stripped of whitespace) if set.
-
-    Raises:
-        ValueError: If both VLLM_FL_FLAGOS_WHITELIST and VLLM_FL_FLAGOS_BLACKLIST
-                    are set simultaneously.
-
-    Example:
-        >>> # Set whitelist only:
-        >>> # export VLLM_FL_FLAGOS_WHITELIST="silu_and_mul,rms_norm"
-        >>> whitelist, blacklist = get_flag_gems_whitelist_blacklist()
-        >>> # whitelist: ["silu_and_mul", "rms_norm"]
-        >>> # blacklist: None
-
-        >>> # Set blacklist only:
-        >>> # export VLLM_FL_FLAGOS_BLACKLIST="index,index_put_"
-        >>> whitelist, blacklist = get_flag_gems_whitelist_blacklist()
-        >>> # whitelist: None
-        >>> # blacklist: ["index", "index_put_"]
-    """
-    whitelist_str = os.environ.get("VLLM_FL_FLAGOS_WHITELIST", "")
-    blacklist_str = os.environ.get("VLLM_FL_FLAGOS_BLACKLIST", "")
-
-    # Check if both are set
-    if whitelist_str and blacklist_str:
-        raise ValueError(
-            "Cannot set both VLLM_FL_FLAGOS_WHITELIST and VLLM_FL_FLAGOS_BLACKLIST "
-            "simultaneously. Please set only one of them."
-        )
-
-    whitelist = None
-    blacklist = None
-
-    if whitelist_str:
-        whitelist = [op.strip() for op in whitelist_str.split(",") if op.strip()]
-
-    if blacklist_str:
-        blacklist = [op.strip() for op in blacklist_str.split(",") if op.strip()]
-
-    return whitelist, blacklist
-
-
 def get_flaggems_all_ops() -> list[str]:
     """
     Get all FlagGems operator names from flag_gems._FULL_CONFIG.
@@ -201,6 +212,40 @@ def get_oot_whitelist() -> Optional[list[str]]:
     if not whitelist_str:
         return None
     return [op.strip() for op in whitelist_str.split(",") if op.strip()]
+
+
+def get_oot_blacklist() -> Optional[list[str]]:
+    """
+    Get OOT operator blacklist from environment variable or platform config.
+
+    Priority (highest to lowest):
+    1. VLLM_FL_OOT_WHITELIST env var: If set, blacklist is ignored
+    2. VLLM_FL_OOT_BLACKLIST env var: These ops won't be registered
+    3. Platform config oot_blacklist: Default blacklist from config file
+
+    Returns:
+        List of OOT operator names to NOT register, or None if not set.
+    """
+    # If whitelist is set, blacklist is ignored
+    whitelist_str = os.environ.get("VLLM_FL_OOT_WHITELIST", "")
+    if whitelist_str:
+        return None
+
+    # Priority 2: Blacklist from env var
+    blacklist_str = os.environ.get("VLLM_FL_OOT_BLACKLIST", "")
+    if blacklist_str:
+        return [op.strip() for op in blacklist_str.split(",") if op.strip()]
+
+    # Priority 3: Blacklist from platform config
+    try:
+        from vllm_fl.dispatch.config import get_oot_blacklist as config_get_oot_blacklist
+        config_blacklist = config_get_oot_blacklist()
+        if config_blacklist:
+            return config_blacklist
+    except Exception:
+        pass
+
+    return None
 
 
 def is_oot_enabled() -> bool:
