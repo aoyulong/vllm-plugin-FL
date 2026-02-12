@@ -49,7 +49,7 @@ A vLLM plugin built on the FlagOS unified multi-chip backend.
     ```sh
     git clone https://github.com/flagos-ai/FlagCX.git
     cd FlagCX
-    git checkout -b v0.7.0
+    git checkout -b v0.9.0
     git submodule update --init --recursive
     ```
 
@@ -66,7 +66,9 @@ A vLLM plugin built on the FlagOS unified multi-chip backend.
     3.4 Installation FlagCX
     ```sh
     cd plugin/torch/
-    python setup.py develop --adaptor [xxx]
+    FLAGCX_ADAPTOR=[xxx] pip install . --no-build-isolation
+    # or editable install
+    FLAGCX_ADAPTOR=[xxx] pip install -e . --no-build-isolation
     ```
     Note: [xxx] should be selected according to the current platform, e.g., nvidia, ascend, etc.
 
