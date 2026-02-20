@@ -10,10 +10,10 @@ In theory, vllm-plugin-FL can support all models available in vLLM, as long as n
 
 | Model | Status | Reference |
 |-------|--------|-----------|
-| Qwen3.5 | Supported | [example](./examples/qwen3_5_offline_inference.py) |
-| Qwen3-Next | Supported | [example](./examples/qwen3_next_offline_inference.py) |
+| Qwen3.5-397B-A17B | Supported | [example](./examples/qwen3_5_offline_inference.py) |
+| Qwen3-Next-80B-A3B | Supported | [example](./examples/qwen3_next_offline_inference.py) |
 | Qwen3-4B | Supported | [example](./examples/offline_inference.py) |
-| MiniCPM | Supported | [example](./examples/minicpm/) |
+| MiniCPM-o 4.5 | Supported | [example](./examples/minicpm/) |
 
 ### Supported Chips
 
@@ -22,7 +22,7 @@ In theory, vllm-plugin-FL can support all models available in vLLM, as long as n
 | NVIDIA | Supported | - |
 | Ascend | Merging | [PR #55](https://github.com/flagos-ai/vllm-plugin-FL/pull/55) |
 | MetaX | Merging | [PR #47](https://github.com/flagos-ai/vllm-plugin-FL/pull/47) |
-| Pingtouge | Merging | - |
+| Pingtouge-Zhenwu | Supported | - |
 | Iluvatar | Merging | [PR #58](https://github.com/flagos-ai/vllm-plugin-FL/pull/58) |
 | Tsingmicro | Merging | [PR #52](https://github.com/flagos-ai/vllm-plugin-FL/pull/52) |
 
