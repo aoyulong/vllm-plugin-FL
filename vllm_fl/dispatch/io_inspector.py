@@ -28,6 +28,10 @@ Configuration (priority order):
         VLLM_FL_IO_INSPECT_TORCH_FUNCS:
             "1"                     - Inspect all torch functional ops
             "matmul,softmax"        - Inspect specific torch functions
+        VLLM_FL_IO_RANK:
+            "all"                   - Inspect on all ranks (default)
+            "0"                     - Inspect only on rank 0
+            "0,2,4"                 - Inspect only on ranks 0, 2, 4
 """
 
 from __future__ import annotations
@@ -44,12 +48,16 @@ from ._io_common import (
     format_result,
     format_value,
     get_module_class_name,
+    get_rank,
     get_torch_func_name,
     guard_active,
     next_exec_order,
     parse_io_config_from_yaml,
+    parse_rank_filter,
     parse_torch_funcs_config,
+    rank_enabled,
     set_guard,
+    set_rank_filter,
     should_inspect_torch_func,
 )
 from .logger_manager import get_logger
@@ -132,8 +140,9 @@ def _log_inputs(label: str, args: tuple, kwargs: dict,
                 skip_module_arg: bool = False,
                 exec_order: Optional[int] = None) -> None:
     """Log operator/module inputs."""
+    rank = get_rank()
     order_str = f" #{exec_order}" if exec_order is not None else ""
-    lines = [f"[IO_INSPECT]{order_str} {label} INPUTS:"]
+    lines = [f"[IO_INSPECT][rank={rank}]{order_str} {label} INPUTS:"]
     for i, arg in enumerate(args):
         if skip_module_arg and i == 0 and isinstance(arg, torch.nn.Module):
             continue
@@ -146,8 +155,9 @@ def _log_inputs(label: str, args: tuple, kwargs: dict,
 def _log_outputs(label: str, result: Any,
                  exec_order: Optional[int] = None) -> None:
     """Log operator/module outputs."""
+    rank = get_rank()
     order_str = f" #{exec_order}" if exec_order is not None else ""
-    logger.info(f"[IO_INSPECT]{order_str} {label} OUTPUTS:\n{format_result(result)}")
+    logger.info(f"[IO_INSPECT][rank={rank}]{order_str} {label} OUTPUTS:\n{format_result(result)}")
 
 
 # ── Public API ──
@@ -169,6 +179,8 @@ def inspect_before(op_name: str, args: tuple, kwargs: dict,
             order is allocated internally (standalone usage).
     """
     if guard_active():
+        return
+    if not rank_enabled():
         return
     if not _should_inspect(op_name, args):
         return
@@ -192,6 +204,8 @@ def inspect_after(op_name: str, args: tuple, result: Any,
     """
     if guard_active():
         return
+    if not rank_enabled():
+        return
     if not _should_inspect(op_name, args):
         return
     module_name = get_module_class_name(args)
@@ -207,6 +221,7 @@ def enable_io_inspect(
     ops: Optional[Set[str]] = None,
     modules: Optional[Set[str]] = None,
     torch_funcs: bool = False,
+    ranks: Optional[Set[int]] = None,
 ) -> None:
     """
     Programmatically enable IO inspection.
@@ -219,6 +234,7 @@ def enable_io_inspect(
         ops: Dispatch-managed op names to inspect. None = all.
         modules: nn.Module class names to inspect. None = all.
         torch_funcs: Also intercept bare torch functional ops.
+        ranks: Set of ranks to inspect on. None = all ranks.
     """
     global _enabled, _match_all, _op_filter, _module_filter
     global _torch_funcs_enabled, _torch_func_filter
@@ -236,10 +252,12 @@ def enable_io_inspect(
     _torch_func_filter = set()
     _enabled = True
 
+    set_rank_filter(ranks)
     _activate_hooks()
 
     logger.info(
-        f"IO Inspect enabled: "
+        f"IO Inspect enabled: rank={get_rank()}, "
+        f"rank_filter={ranks or 'all'}, "
         f"ops={_op_filter or 'all'}, modules={_module_filter or 'all'}, "
         f"torch_funcs={_torch_funcs_enabled}"
     )
@@ -257,7 +275,7 @@ def disable_io_inspect() -> None:
 
 def _global_forward_pre_hook(module, args):
     """Global pre-hook: log inputs for matching modules."""
-    if not _enabled or guard_active():
+    if not _enabled or guard_active() or not rank_enabled():
         return
     cls_name = type(module).__name__
     if not _should_inspect_module(cls_name):
@@ -272,7 +290,7 @@ def _global_forward_pre_hook(module, args):
 
 def _global_forward_post_hook(module, args, output):
     """Global post-hook: log outputs for matching modules."""
-    if not _enabled or guard_active():
+    if not _enabled or guard_active() or not rank_enabled():
         return
     cls_name = type(module).__name__
     if not _should_inspect_module(cls_name):
@@ -291,7 +309,7 @@ if HAS_TORCH_FUNC_MODE:
     class _InspectTorchFuncMode(TorchFunctionMode):
         def __torch_function__(self, func, types, args=(), kwargs=None):
             kwargs = kwargs or {}
-            if not _enabled or guard_active():
+            if not _enabled or guard_active() or not rank_enabled():
                 return func(*args, **kwargs)
 
             func_name = get_torch_func_name(func)
@@ -471,10 +489,13 @@ def _init_from_env() -> None:
             _torch_funcs_enabled = tf_enabled
             _torch_func_filter = tf_filter
             _enabled = True
+
+            set_rank_filter(io_cfg.get("ranks"))
             _activate_hooks()
 
             logger.info(
-                f"IO Inspect enabled (YAML): "
+                f"IO Inspect enabled (YAML): rank={get_rank()}, "
+                f"rank_filter={io_cfg.get('ranks') or 'all'}, "
                 f"ops={_op_filter or 'all'}, modules={_module_filter or 'all'}, "
                 f"torch_funcs={_torch_funcs_enabled}"
             )
@@ -499,10 +520,16 @@ def _init_from_env() -> None:
         _torch_func_filter = set()
 
     if _enabled:
+        # Parse rank filter from env var (shared by inspector and dumper)
+        rank_env = os.environ.get("VLLM_FL_IO_RANK", "")
+        if rank_env:
+            set_rank_filter(parse_rank_filter(rank_env))
+
         _activate_hooks()
 
         logger.info(
-            f"IO Inspect enabled: "
+            f"IO Inspect enabled: rank={get_rank()}, "
+            f"rank_filter={parse_rank_filter(rank_env) if rank_env else 'all'}, "
             f"ops={_op_filter or 'all'}, modules={_module_filter or 'all'}, "
             f"torch_funcs={_torch_funcs_enabled}"
         )

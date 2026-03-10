@@ -27,10 +27,11 @@ Configuration (priority order):
         VLLM_FL_IO_DUMP_MAX_CALLS    - Max calls per op (0 = unlimited)
         VLLM_FL_IO_DUMP_STEP_RANGE   - "start,end" half-open range
         VLLM_FL_IO_DUMP_TORCH_FUNCS  - "1" or "matmul,softmax"
+        VLLM_FL_IO_RANK              - Rank filter: "all", "0", "0,2,4"
 
 File layout:
-    dump_dir/step_0005/rms_norm/order_000001_call_0001_{input,output}.pt
-    dump_dir/step_0005/torch.matmul/order_000002_call_0001_{input,output}.pt
+    dump_dir/rank_0000/step_0005/rms_norm/order_000001_call_0001_{input,output}.pt
+    dump_dir/rank_0000/step_0005/torch.matmul/order_000002_call_0001_{input,output}.pt
 """
 
 from __future__ import annotations
@@ -46,13 +47,17 @@ from ._io_common import (
     HAS_TORCH_FUNC_MODE,
     TorchFunctionMode,
     get_module_class_name,
+    get_rank,
     get_torch_func_name,
     guard_active,
     next_exec_order,
     parse_io_config_from_yaml,
+    parse_rank_filter,
     parse_torch_funcs_config,
+    rank_enabled,
     reset_exec_order,
     set_guard,
+    set_rank_filter,
     should_inspect_torch_func,
 )
 from .logger_manager import get_logger
@@ -220,7 +225,9 @@ def _get_call_dir(op_name: str, exec_order: Optional[int] = None) -> Tuple[str, 
     with _lock:
         count = _call_counters.get(op_name, 0) + 1
         _call_counters[op_name] = count
-    step_dir = os.path.join(_dump_dir, f"step_{_step_counter:04d}")
+    rank = get_rank()
+    rank_dir = os.path.join(_dump_dir, f"rank_{rank:04d}")
+    step_dir = os.path.join(rank_dir, f"step_{_step_counter:04d}")
     op_dir = os.path.join(step_dir, safe_name)
     os.makedirs(op_dir, exist_ok=True)
     _push_pairing(op_name, count, order, op_dir)
@@ -242,7 +249,7 @@ def _dump_input(op_name: str, args: tuple, kwargs: dict,
         op_dir, call_num, order = _get_call_dir(op_name, exec_order=exec_order)
         path = os.path.join(op_dir, f"order_{order:06d}_call_{call_num:04d}_input.pt")
         data = _build_input_dict(args, kwargs)
-        data["__meta__"] = {"op_name": op_name, "exec_order": order, "call_num": call_num}
+        data["__meta__"] = {"op_name": op_name, "exec_order": order, "call_num": call_num, "rank": get_rank()}
         torch.save(data, path)
         logger.debug(f"Dumped input: {path}")
     except Exception as e:
@@ -259,7 +266,7 @@ def _dump_output(op_name: str, result: Any) -> None:
         call_num, order, op_dir = pairing
         path = os.path.join(op_dir, f"order_{order:06d}_call_{call_num:04d}_output.pt")
         data = _build_output_dict(result)
-        data["__meta__"] = {"op_name": op_name, "exec_order": order, "call_num": call_num}
+        data["__meta__"] = {"op_name": op_name, "exec_order": order, "call_num": call_num, "rank": get_rank()}
         torch.save(data, path)
         logger.debug(f"Dumped output: {path}")
     except Exception as e:
@@ -283,6 +290,8 @@ def dump_before(op_name: str, args: tuple, kwargs: dict,
     """
     if guard_active():
         return
+    if not rank_enabled():
+        return
     if not _should_dump(op_name, args):
         return
     set_guard(True)
@@ -295,6 +304,8 @@ def dump_before(op_name: str, args: tuple, kwargs: dict,
 def dump_after(op_name: str, args: tuple, result: Any) -> None:
     """Dump operator outputs (called from OpManager)."""
     if guard_active():
+        return
+    if not rank_enabled():
         return
     if not _should_dump(op_name, args):
         return
@@ -332,6 +343,7 @@ def enable_io_dump(
     max_calls: int = 0,
     step_range: Optional[Tuple[int, int]] = None,
     torch_funcs: bool = False,
+    ranks: Optional[Set[int]] = None,
 ) -> None:
     """
     Programmatically enable IO dumping.
@@ -346,6 +358,7 @@ def enable_io_dump(
         max_calls: Max calls per op to dump (0 = unlimited).
         step_range: (start, end) half-open range for step filtering.
         torch_funcs: Also intercept bare torch functional ops.
+        ranks: Set of ranks to dump on. None = all ranks.
     """
     global _enabled, _dump_dir, _match_all, _op_filter, _module_filter
     global _max_calls, _step_range, _torch_funcs_enabled, _torch_func_filter
@@ -367,10 +380,12 @@ def enable_io_dump(
     _torch_func_filter = set()
     _enabled = True
 
+    set_rank_filter(ranks)
     _activate_hooks()
 
     logger.info(
-        f"IO Dump enabled: dir={_dump_dir}, "
+        f"IO Dump enabled: rank={get_rank()}, "
+        f"rank_filter={ranks or 'all'}, dir={_dump_dir}, "
         f"ops={_op_filter or 'all'}, modules={_module_filter or 'all'}, "
         f"max_calls={_max_calls}, step_range={_step_range}, "
         f"torch_funcs={_torch_funcs_enabled}"
@@ -389,7 +404,7 @@ def disable_io_dump() -> None:
 
 def _global_forward_pre_hook(module, args):
     """Global pre-hook: dump inputs for matching modules."""
-    if not _enabled or guard_active():
+    if not _enabled or guard_active() or not rank_enabled():
         return
     cls_name = type(module).__name__
     if not _should_dump_module(cls_name):
@@ -405,7 +420,7 @@ def _global_forward_pre_hook(module, args):
 
 def _global_forward_post_hook(module, args, output):
     """Global post-hook: dump outputs for matching modules."""
-    if not _enabled or guard_active():
+    if not _enabled or guard_active() or not rank_enabled():
         return
     cls_name = type(module).__name__
     if not _should_dump_module(cls_name):
@@ -426,7 +441,7 @@ if HAS_TORCH_FUNC_MODE:
     class _DumpTorchFuncMode(TorchFunctionMode):
         def __torch_function__(self, func, types, args=(), kwargs=None):
             kwargs = kwargs or {}
-            if not _enabled or guard_active():
+            if not _enabled or guard_active() or not rank_enabled():
                 return func(*args, **kwargs)
 
             func_name = get_torch_func_name(func)
@@ -624,10 +639,13 @@ def _init_from_env() -> None:
             _torch_func_filter = tf_filter
 
             _enabled = True
+
+            set_rank_filter(io_cfg.get("ranks"))
             _activate_hooks()
 
             logger.info(
-                f"IO Dump enabled (YAML): dir={_dump_dir}, "
+                f"IO Dump enabled (YAML): rank={get_rank()}, "
+                f"rank_filter={io_cfg.get('ranks') or 'all'}, dir={_dump_dir}, "
                 f"ops={_op_filter or 'all'}, modules={_module_filter or 'all'}, "
                 f"max_calls={_max_calls}, step_range={_step_range}, "
                 f"torch_funcs={_torch_funcs_enabled}"
@@ -678,10 +696,18 @@ def _init_from_env() -> None:
         _torch_func_filter = set()
 
     _enabled = True
+
+    # Parse rank filter from env var (shared by inspector and dumper)
+    rank_env = os.environ.get("VLLM_FL_IO_RANK", "")
+    if rank_env:
+        set_rank_filter(parse_rank_filter(rank_env))
+
     _activate_hooks()
 
     logger.info(
-        f"IO Dump enabled: dir={_dump_dir}, "
+        f"IO Dump enabled: rank={get_rank()}, "
+        f"rank_filter={parse_rank_filter(rank_env) if rank_env else 'all'}, "
+        f"dir={_dump_dir}, "
         f"ops={_op_filter or 'all'}, modules={_module_filter or 'all'}, "
         f"max_calls={_max_calls}, step_range={_step_range}, "
         f"torch_funcs={_torch_funcs_enabled}"

@@ -18,10 +18,15 @@ from vllm_fl.dispatch._io_common import (
     format_result,
     format_value,
     get_module_class_name,
+    get_rank,
     next_exec_order,
     parse_io_config_from_yaml,
+    parse_rank_filter,
     parse_torch_funcs_config,
+    rank_enabled,
     reset_exec_order,
+    reset_rank,
+    set_rank_filter,
 )
 from vllm_fl.dispatch.io_inspector import (
     _parse_config,
@@ -781,3 +786,241 @@ class TestExecOrderParam:
         from vllm_fl.dispatch._io_common import get_exec_order
 
         assert get_exec_order() >= 1
+
+
+class TestRankCommon:
+    """Test rank detection and filtering utilities in _io_common."""
+
+    def setup_method(self):
+        reset_rank()
+        set_rank_filter(None)
+
+    def teardown_method(self):
+        reset_rank()
+        set_rank_filter(None)
+        os.environ.pop("RANK", None)
+        os.environ.pop("LOCAL_RANK", None)
+
+    def test_get_rank_default(self):
+        assert get_rank() == 0
+
+    @patch.dict(os.environ, {"RANK": "3"}, clear=False)
+    def test_get_rank_from_env(self):
+        reset_rank()
+        assert get_rank() == 3
+
+    @patch.dict(os.environ, {"LOCAL_RANK": "5"}, clear=False)
+    def test_get_rank_from_local_rank(self):
+        os.environ.pop("RANK", None)
+        reset_rank()
+        assert get_rank() == 5
+
+    def test_rank_cached(self):
+        reset_rank()
+        r1 = get_rank()
+        r2 = get_rank()
+        assert r1 == r2
+
+    def test_rank_enabled_all(self):
+        set_rank_filter(None)
+        assert rank_enabled()
+
+    def test_rank_enabled_matching(self):
+        set_rank_filter({0})
+        reset_rank()
+        assert rank_enabled()
+
+    @patch.dict(os.environ, {"RANK": "1"}, clear=False)
+    def test_rank_enabled_not_matching(self):
+        reset_rank()
+        set_rank_filter({0})
+        assert not rank_enabled()
+
+    def test_parse_rank_filter_all(self):
+        assert parse_rank_filter("all") is None
+        assert parse_rank_filter("") is None
+
+    def test_parse_rank_filter_single(self):
+        assert parse_rank_filter("0") == {0}
+
+    def test_parse_rank_filter_multiple(self):
+        assert parse_rank_filter("0,2,4") == {0, 2, 4}
+
+    def test_parse_rank_filter_whitespace(self):
+        assert parse_rank_filter(" 0 , 1 ") == {0, 1}
+
+    def test_parse_rank_filter_invalid(self):
+        assert parse_rank_filter("abc") is None
+
+
+class TestRankInInspectorLogs:
+    """Test that rank appears in inspector log output."""
+
+    def setup_method(self):
+        disable_io_inspect()
+        reset_rank()
+        set_rank_filter(None)
+
+    def teardown_method(self):
+        disable_io_inspect()
+        reset_rank()
+        set_rank_filter(None)
+
+    def test_rank_in_input_log(self, caplog):
+        import logging
+
+        enable_io_inspect()
+
+        with caplog.at_level(logging.INFO, logger="vllm_fl.dispatch.io_inspect"):
+            inspect_before("op", (torch.zeros(2),), {})
+
+        assert any("[rank=0]" in r.message for r in caplog.records)
+
+    def test_rank_in_output_log(self, caplog):
+        import logging
+
+        enable_io_inspect()
+
+        with caplog.at_level(logging.INFO, logger="vllm_fl.dispatch.io_inspect"):
+            inspect_after("op", (), torch.zeros(2))
+
+        assert any("[rank=0]" in r.message for r in caplog.records)
+
+    @patch.dict(os.environ, {"RANK": "7"}, clear=False)
+    def test_rank_in_log_nonzero(self, caplog):
+        import logging
+
+        reset_rank()
+        enable_io_inspect()
+
+        with caplog.at_level(logging.INFO, logger="vllm_fl.dispatch.io_inspect"):
+            inspect_before("op", (torch.zeros(2),), {})
+
+        assert any("[rank=7]" in r.message for r in caplog.records)
+
+
+class TestRankFilterInInspector:
+    """Test rank filtering prevents inspection on non-matching ranks."""
+
+    def setup_method(self):
+        disable_io_inspect()
+        reset_rank()
+        set_rank_filter(None)
+
+    def teardown_method(self):
+        disable_io_inspect()
+        reset_rank()
+        set_rank_filter(None)
+        os.environ.pop("RANK", None)
+
+    def test_rank_filter_blocks_inspection(self, caplog):
+        import logging
+
+        enable_io_inspect(ranks={1, 2})  # current rank is 0
+        reset_rank()
+
+        with caplog.at_level(logging.INFO, logger="vllm_fl.dispatch.io_inspect"):
+            inspect_before("op", (torch.zeros(2),), {})
+
+        assert not any("INPUTS" in r.message for r in caplog.records)
+
+    def test_rank_filter_allows_matching(self, caplog):
+        import logging
+
+        reset_rank()
+        enable_io_inspect(ranks={0})
+
+        with caplog.at_level(logging.INFO, logger="vllm_fl.dispatch.io_inspect"):
+            inspect_before("op", (torch.zeros(2),), {})
+
+        assert any("INPUTS" in r.message for r in caplog.records)
+
+    @patch.dict(
+        os.environ,
+        {"VLLM_FL_IO_INSPECT": "1", "VLLM_FL_IO_RANK": "0"},
+        clear=False,
+    )
+    def test_env_rank_filter(self):
+        reset_rank()
+        io_inspector._init_from_env()
+        assert is_inspect_enabled()
+        assert rank_enabled()
+
+    @patch.dict(
+        os.environ,
+        {"VLLM_FL_IO_INSPECT": "1", "VLLM_FL_IO_RANK": "3"},
+        clear=False,
+    )
+    def test_env_rank_filter_blocks(self):
+        reset_rank()
+        io_inspector._init_from_env()
+        assert is_inspect_enabled()
+        assert not rank_enabled()
+
+
+class TestYamlRanksConfig:
+    """Test YAML ranks field parsing."""
+
+    def setup_method(self):
+        disable_io_inspect()
+        reset_rank()
+        set_rank_filter(None)
+
+    def teardown_method(self):
+        disable_io_inspect()
+        reset_rank()
+        set_rank_filter(None)
+
+    def test_yaml_ranks_list(self):
+        cfg_content = """
+io_inspect:
+  enabled: true
+  ranks: [0, 1]
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(cfg_content)
+            cfg_path = f.name
+
+        try:
+            result = parse_io_config_from_yaml(cfg_path)
+            assert result["io_inspect"]["ranks"] == {0, 1}
+        finally:
+            os.unlink(cfg_path)
+
+    def test_yaml_ranks_single(self):
+        cfg_content = """
+io_inspect:
+  enabled: true
+  ranks: 0
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(cfg_content)
+            cfg_path = f.name
+
+        try:
+            result = parse_io_config_from_yaml(cfg_path)
+            assert result["io_inspect"]["ranks"] == {0}
+        finally:
+            os.unlink(cfg_path)
+
+    @patch.dict(os.environ, {}, clear=False)
+    def test_init_from_yaml_with_ranks(self):
+        reset_rank()
+        cfg_content = """
+io_inspect:
+  enabled: true
+  ranks: [0]
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(cfg_content)
+            cfg_path = f.name
+
+        try:
+            os.environ.pop("VLLM_FL_IO_INSPECT", None)
+            with patch.dict(os.environ, {"VLLM_FL_CONFIG": cfg_path}, clear=False):
+                io_inspector._init_from_env()
+            assert is_inspect_enabled()
+            assert rank_enabled()
+        finally:
+            os.unlink(cfg_path)
+            set_rank_filter(None)

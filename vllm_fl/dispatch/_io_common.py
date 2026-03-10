@@ -34,6 +34,97 @@ try:
 except ImportError:
     HAS_GLOBAL_MODULE_HOOKS = False
 
+# ── Distributed rank detection ──
+
+_rank: Optional[int] = None  # cached after first call
+
+
+def get_rank() -> int:
+    """Get the current distributed rank.
+
+    Resolution order:
+    1. ``torch.distributed.get_rank()`` if the default process group is initialized
+    2. ``RANK`` environment variable
+    3. ``LOCAL_RANK`` environment variable
+    4. 0 (single-process fallback)
+
+    The result is cached for the lifetime of the process.
+    """
+    global _rank
+    if _rank is not None:
+        return _rank
+    try:
+        import torch.distributed as dist
+        if dist.is_initialized():
+            _rank = dist.get_rank()
+            return _rank
+    except Exception:
+        pass
+    for var in ("RANK", "LOCAL_RANK"):
+        val = os.environ.get(var)
+        if val is not None:
+            try:
+                _rank = int(val)
+                return _rank
+            except ValueError:
+                pass
+    _rank = 0
+    return _rank
+
+
+def reset_rank() -> None:
+    """Reset cached rank (for testing only)."""
+    global _rank
+    _rank = None
+
+
+# ── Rank filter ──
+
+_rank_filter: Optional[Set[int]] = None  # None = all ranks
+
+
+def set_rank_filter(ranks: Optional[Set[int]]) -> None:
+    """Set which ranks should run IO hooks. None = all ranks."""
+    global _rank_filter
+    _rank_filter = ranks
+
+
+def get_rank_filter() -> Optional[Set[int]]:
+    """Get current rank filter. None means all ranks are enabled."""
+    return _rank_filter
+
+
+def rank_enabled() -> bool:
+    """Check if the current rank should run IO hooks."""
+    if _rank_filter is None:
+        return True
+    return get_rank() in _rank_filter
+
+
+def parse_rank_filter(value: str) -> Optional[Set[int]]:
+    """Parse a rank filter string.
+
+    Args:
+        value: ``"all"`` or ``""`` for all ranks, or comma-separated
+            rank numbers like ``"0"`` or ``"0,2,4"``.
+
+    Returns:
+        None for all ranks, or a set of rank integers.
+    """
+    value = value.strip().lower()
+    if not value or value == "all":
+        return None
+    ranks: Set[int] = set()
+    for token in value.split(","):
+        token = token.strip()
+        if token:
+            try:
+                ranks.add(int(token))
+            except ValueError:
+                pass
+    return ranks if ranks else None
+
+
 # ── Re-entrancy guard (shared, per-thread) ──
 
 _in_hook = threading.local()
@@ -253,6 +344,7 @@ def _parse_inspect_section(cfg: Dict[str, Any]) -> Dict[str, Any]:
     parsed["ops"] = _parse_string_list(cfg.get("ops"))
     parsed["modules"] = _parse_string_list(cfg.get("modules"))
     parsed["torch_funcs"] = _parse_torch_funcs_yaml(cfg.get("torch_funcs"))
+    parsed["ranks"] = _parse_ranks_yaml(cfg.get("ranks"))
 
     return parsed
 
@@ -283,6 +375,7 @@ def _parse_dump_section(cfg: Dict[str, Any]) -> Dict[str, Any]:
         parsed["step_range"] = None
 
     parsed["torch_funcs"] = _parse_torch_funcs_yaml(cfg.get("torch_funcs"))
+    parsed["ranks"] = _parse_ranks_yaml(cfg.get("ranks"))
 
     return parsed
 
@@ -322,3 +415,29 @@ def _parse_torch_funcs_yaml(value: Any) -> Tuple[bool, Set[str]]:
     if isinstance(value, str):
         return parse_torch_funcs_config(value)
     return False, set()
+
+
+def _parse_ranks_yaml(value: Any) -> Optional[Set[int]]:
+    """Parse ``ranks`` from YAML config.
+
+    Accepts:
+      - None / "all" → None (all ranks)
+      - list of ints: [0, 1, 2]
+      - single int: 0
+      - string: "0,2,4" or "all"
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        ranks = set()
+        for v in value:
+            try:
+                ranks.add(int(v))
+            except (ValueError, TypeError):
+                pass
+        return ranks if ranks else None
+    if isinstance(value, int):
+        return {value}
+    if isinstance(value, str):
+        return parse_rank_filter(value)
+    return None

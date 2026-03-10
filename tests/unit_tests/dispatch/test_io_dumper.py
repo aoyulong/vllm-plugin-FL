@@ -20,7 +20,10 @@ from vllm_fl.dispatch._io_common import (
     next_exec_order,
     parse_io_config_from_yaml,
     parse_torch_funcs_config,
+    rank_enabled,
     reset_exec_order,
+    reset_rank,
+    set_rank_filter,
 )
 from vllm_fl.dispatch.io_dumper import (
     _build_input_dict,
@@ -183,7 +186,7 @@ class TestDumpBeforeAfter:
         dump_before("test_op", (t,), {"epsilon": 1e-6})
 
         # Find the input file (filename includes exec order)
-        step_dir = os.path.join(dump_dir, "step_0000", "test_op")
+        step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
         assert os.path.isdir(step_dir)
         input_files = [f for f in os.listdir(step_dir) if f.endswith("_input.pt")]
         assert len(input_files) == 1
@@ -208,7 +211,7 @@ class TestDumpBeforeAfter:
         t_out = torch.ones(2, 3)
         dump_after("test_op", (t_in,), t_out)
 
-        step_dir = os.path.join(dump_dir, "step_0000", "test_op")
+        step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
         output_files = [f for f in os.listdir(step_dir) if f.endswith("_output.pt")]
         assert len(output_files) == 1
 
@@ -226,7 +229,7 @@ class TestDumpBeforeAfter:
         t2 = torch.ones(3)
         dump_after("test_op", (t_in,), (t1, t2))
 
-        step_dir = os.path.join(dump_dir, "step_0000", "test_op")
+        step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
         output_files = [f for f in os.listdir(step_dir) if f.endswith("_output.pt")]
         assert len(output_files) == 1
         data = torch.load(os.path.join(step_dir, output_files[0]), weights_only=False)
@@ -238,7 +241,7 @@ class TestDumpBeforeAfter:
         t = torch.zeros(2, 3)
         dump_before("test_op", (t,), {})
 
-        step_dir = os.path.join(dump_dir, "step_0000", "test_op")
+        step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
         assert not os.path.exists(step_dir)
 
 
@@ -271,14 +274,14 @@ class TestIoDumpStep:
 
         # Step 0
         dump_before("test_op", (t,), {})
-        step0_dir = os.path.join(dump_dir, "step_0000", "test_op")
+        step0_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
         assert os.path.isdir(step0_dir)
         assert any(f.endswith("_input.pt") for f in os.listdir(step0_dir))
 
         # Step 1
         io_dump_step()
         dump_before("test_op", (t,), {})
-        step1_dir = os.path.join(dump_dir, "step_0001", "test_op")
+        step1_dir = os.path.join(dump_dir, "rank_0000", "step_0001", "test_op")
         assert os.path.isdir(step1_dir)
         assert any(f.endswith("_input.pt") for f in os.listdir(step1_dir))
 
@@ -442,7 +445,7 @@ class TestForwardDumpHooks:
         model(x)
 
         # Check files were created
-        step_dir = os.path.join(dump_dir, "step_0000")
+        step_dir = os.path.join(dump_dir, "rank_0000", "step_0000")
         assert os.path.isdir(step_dir)
         # The label should be "Linear." (root module has empty name)
         # Find any .pt files
@@ -557,7 +560,7 @@ class TestGlobalModuleHooks:
         model(x)
 
         # Check files were created
-        step_dir = os.path.join(dump_dir, "step_0000")
+        step_dir = os.path.join(dump_dir, "rank_0000", "step_0000")
         assert os.path.isdir(step_dir)
         found_pt = False
         for root, dirs, files in os.walk(step_dir):
@@ -621,7 +624,7 @@ class TestDumpTorchFunctionMode:
         torch.matmul(a, b)
 
         # Check that files were created under torch.matmul directory
-        step_dir = os.path.join(dump_dir, "step_0000")
+        step_dir = os.path.join(dump_dir, "rank_0000", "step_0000")
         assert os.path.isdir(step_dir)
         found_pt = False
         for root, dirs, files in os.walk(step_dir):
@@ -727,7 +730,7 @@ class TestExecOrder:
 
         # Check file names include order prefix
         for op in ["op_a", "op_b"]:
-            op_dir = os.path.join(dump_dir, "step_0000", op)
+            op_dir = os.path.join(dump_dir, "rank_0000", "step_0000", op)
             files = os.listdir(op_dir)
             assert any("order_" in f for f in files)
 
@@ -737,7 +740,7 @@ class TestExecOrder:
         t = torch.zeros(2)
         dump_before("test_op", (t,), {})
 
-        step_dir = os.path.join(dump_dir, "step_0000", "test_op")
+        step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
         input_files = [f for f in os.listdir(step_dir) if f.endswith("_input.pt")]
         data = torch.load(os.path.join(step_dir, input_files[0]), weights_only=False)
         assert data["__meta__"]["exec_order"] == 1
@@ -867,7 +870,7 @@ class TestDumpCleanup:
         dump_after("test_op", (t,), torch.ones(2))
 
         # Only the input file should exist (no output file)
-        step_dir = os.path.join(dump_dir, "step_0000", "test_op")
+        step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
         input_files = [f for f in os.listdir(step_dir) if f.endswith("_input.pt")]
         output_files = [f for f in os.listdir(step_dir) if f.endswith("_output.pt")]
         assert len(input_files) == 1
@@ -895,7 +898,7 @@ class TestExecOrderParam:
 
         dump_before("test_op", (t,), {}, exec_order=99)
 
-        step_dir = os.path.join(dump_dir, "step_0000", "test_op")
+        step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
         input_files = [f for f in os.listdir(step_dir) if f.endswith("_input.pt")]
         assert len(input_files) == 1
         assert "order_000099" in input_files[0]
@@ -910,3 +913,179 @@ class TestExecOrderParam:
 
         dump_before("test_op", (t,), {})  # exec_order=None
         assert get_exec_order() >= 1
+
+
+class TestRankInDumper:
+    """Test rank directory layout and metadata in dump files."""
+
+    def setup_method(self):
+        disable_io_dump()
+        reset_exec_order()
+        reset_rank()
+        set_rank_filter(None)
+
+    def teardown_method(self):
+        disable_io_dump()
+        reset_exec_order()
+        reset_rank()
+        set_rank_filter(None)
+        os.environ.pop("RANK", None)
+
+    def test_dump_creates_rank_directory(self, dump_dir):
+        reset_rank()
+        enable_io_dump(dump_dir)
+        reset_exec_order()
+        t = torch.zeros(2)
+        dump_before("test_op", (t,), {})
+
+        rank_dir = os.path.join(dump_dir, "rank_0000")
+        assert os.path.isdir(rank_dir)
+
+    @patch.dict(os.environ, {"RANK": "3"}, clear=False)
+    def test_dump_rank_nonzero(self, dump_dir):
+        reset_rank()
+        enable_io_dump(dump_dir)
+        reset_exec_order()
+        t = torch.zeros(2)
+        dump_before("test_op", (t,), {})
+
+        rank_dir = os.path.join(dump_dir, "rank_0003")
+        assert os.path.isdir(rank_dir)
+        step_dir = os.path.join(rank_dir, "step_0000", "test_op")
+        assert os.path.isdir(step_dir)
+
+    def test_dump_metadata_has_rank(self, dump_dir):
+        reset_rank()
+        enable_io_dump(dump_dir)
+        reset_exec_order()
+        t = torch.zeros(2)
+        dump_before("test_op", (t,), {})
+
+        step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
+        input_files = [f for f in os.listdir(step_dir) if f.endswith("_input.pt")]
+        data = torch.load(os.path.join(step_dir, input_files[0]), weights_only=False)
+        assert data["__meta__"]["rank"] == 0
+
+    def test_output_metadata_has_rank(self, dump_dir):
+        reset_rank()
+        enable_io_dump(dump_dir)
+        reset_exec_order()
+        t = torch.zeros(2)
+        dump_before("test_op", (t,), {})
+        dump_after("test_op", (t,), torch.ones(2))
+
+        step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
+        output_files = [f for f in os.listdir(step_dir) if f.endswith("_output.pt")]
+        data = torch.load(os.path.join(step_dir, output_files[0]), weights_only=False)
+        assert data["__meta__"]["rank"] == 0
+
+
+class TestRankFilterInDumper:
+    """Test rank filtering prevents dumping on non-matching ranks."""
+
+    def setup_method(self):
+        disable_io_dump()
+        reset_exec_order()
+        reset_rank()
+        set_rank_filter(None)
+
+    def teardown_method(self):
+        disable_io_dump()
+        reset_exec_order()
+        reset_rank()
+        set_rank_filter(None)
+        os.environ.pop("RANK", None)
+
+    def test_rank_filter_blocks_dump(self, dump_dir):
+        reset_rank()  # rank 0
+        enable_io_dump(dump_dir, ranks={1, 2})
+        t = torch.zeros(2)
+        dump_before("test_op", (t,), {})
+
+        # No files should be created
+        rank_dir = os.path.join(dump_dir, "rank_0000")
+        assert not os.path.exists(rank_dir)
+
+    def test_rank_filter_allows_matching(self, dump_dir):
+        reset_rank()  # rank 0
+        enable_io_dump(dump_dir, ranks={0})
+        reset_exec_order()
+        t = torch.zeros(2)
+        dump_before("test_op", (t,), {})
+
+        rank_dir = os.path.join(dump_dir, "rank_0000")
+        assert os.path.isdir(rank_dir)
+
+    @patch.dict(
+        os.environ,
+        {"VLLM_FL_IO_DUMP": "/tmp/test_dump", "VLLM_FL_IO_RANK": "0"},
+        clear=False,
+    )
+    def test_env_rank_filter(self):
+        reset_rank()
+        io_dumper._init_from_env()
+        assert is_dump_enabled()
+        assert rank_enabled()
+
+    @patch.dict(
+        os.environ,
+        {"VLLM_FL_IO_DUMP": "/tmp/test_dump", "VLLM_FL_IO_RANK": "3"},
+        clear=False,
+    )
+    def test_env_rank_filter_blocks(self):
+        reset_rank()
+        io_dumper._init_from_env()
+        assert is_dump_enabled()
+        assert not rank_enabled()
+
+
+class TestYamlRanksConfigDumper:
+    """Test YAML ranks field parsing for dumper."""
+
+    def setup_method(self):
+        disable_io_dump()
+        reset_rank()
+        set_rank_filter(None)
+
+    def teardown_method(self):
+        disable_io_dump()
+        reset_rank()
+        set_rank_filter(None)
+
+    def test_yaml_dump_ranks_list(self):
+        cfg_content = """
+io_dump:
+  dir: /tmp/yaml_dump
+  ranks: [0, 1]
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(cfg_content)
+            cfg_path = f.name
+
+        try:
+            result = parse_io_config_from_yaml(cfg_path)
+            assert result["io_dump"]["ranks"] == {0, 1}
+        finally:
+            os.unlink(cfg_path)
+
+    @patch.dict(os.environ, {}, clear=False)
+    def test_init_from_yaml_with_ranks(self, dump_dir):
+        reset_rank()
+        cfg_content = f"""
+io_dump:
+  dir: {dump_dir}
+  ranks: [0]
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(cfg_content)
+            cfg_path = f.name
+
+        try:
+            os.environ.pop("VLLM_FL_IO_DUMP", None)
+            with patch.dict(os.environ, {"VLLM_FL_CONFIG": cfg_path}, clear=False):
+                io_dumper._init_from_env()
+            assert is_dump_enabled()
+            assert rank_enabled()
+        finally:
+            os.unlink(cfg_path)
+            set_rank_filter(None)
