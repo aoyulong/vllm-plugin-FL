@@ -226,16 +226,7 @@ def enable_io_inspect(
 
 def disable_io_inspect() -> None:
     """Programmatically disable IO inspection and remove all hooks."""
-    global _enabled, _match_all, _op_filter, _module_filter, _inspect_all
-    global _torch_funcs_enabled, _torch_func_filter
-
-    _enabled = False
-    _match_all = False
-    _inspect_all = False
-    _op_filter = set()
-    _module_filter = set()
-    _torch_funcs_enabled = False
-    _torch_func_filter = set()
+    _reset_state()
     _deactivate_hooks()
     remove_io_hooks()
 
@@ -412,6 +403,20 @@ def remove_io_hooks() -> None:
     _hook_handles.clear()
 
 
+def _reset_state() -> None:
+    """Reset all module-level state to defaults."""
+    global _enabled, _match_all, _op_filter, _module_filter, _inspect_all
+    global _torch_funcs_enabled, _torch_func_filter
+
+    _enabled = False
+    _match_all = False
+    _inspect_all = False
+    _op_filter = set()
+    _module_filter = set()
+    _torch_funcs_enabled = False
+    _torch_func_filter = set()
+
+
 # ── Environment Initialization ──
 
 
@@ -430,7 +435,7 @@ def _init_from_env() -> None:
         if io_cfg is not None:
             # YAML config is authoritative — if section exists, use it
             if not io_cfg.get("enabled", False):
-                _enabled = False
+                _reset_state()
                 return
             ops = io_cfg.get("ops", set())
             modules = io_cfg.get("modules", set())
@@ -459,7 +464,7 @@ def _init_from_env() -> None:
     # Priority 2: Environment variables
     env_val = os.environ.get("VLLM_FL_IO_INSPECT", "")
     if not env_val or env_val == "0":
-        _enabled = False
+        _reset_state()
         return
 
     _match_all, _op_filter, _module_filter = _parse_config(env_val)

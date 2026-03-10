@@ -399,7 +399,11 @@ class OpManager:
         return unique_candidates
 
     def _call_with_hooks(self, op_name: str, fn, args: tuple, kwargs: dict):
-        """Call fn, wrapping with IO inspect/dump hooks only when enabled."""
+        """Call fn, wrapping with IO inspect/dump hooks only when enabled.
+
+        Hook failures are logged and swallowed so that diagnostic hooks
+        never break the dispatched operator call.
+        """
         do_inspect = is_inspect_enabled()
         do_dump = is_dump_enabled()
 
@@ -407,16 +411,28 @@ class OpManager:
             return fn(*args, **kwargs)
 
         if do_inspect:
-            inspect_before(op_name, args, kwargs)
+            try:
+                inspect_before(op_name, args, kwargs)
+            except Exception as e:
+                logger.debug(f"inspect_before hook failed for '{op_name}': {e}")
         if do_dump:
-            dump_before(op_name, args, kwargs)
+            try:
+                dump_before(op_name, args, kwargs)
+            except Exception as e:
+                logger.debug(f"dump_before hook failed for '{op_name}': {e}")
 
         result = fn(*args, **kwargs)
 
         if do_inspect:
-            inspect_after(op_name, args, result)
+            try:
+                inspect_after(op_name, args, result)
+            except Exception as e:
+                logger.debug(f"inspect_after hook failed for '{op_name}': {e}")
         if do_dump:
-            dump_after(op_name, args, result)
+            try:
+                dump_after(op_name, args, result)
+            except Exception as e:
+                logger.debug(f"dump_after hook failed for '{op_name}': {e}")
 
         return result
 

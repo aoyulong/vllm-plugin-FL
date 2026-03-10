@@ -148,9 +148,13 @@ def _serialize_value(value: Any) -> Any:
         return value.detach().cpu()
     if isinstance(value, torch.nn.Module):
         return f"<module:{type(value).__name__}>"
+    if isinstance(value, dict):
+        return {k: _serialize_value(v) for k, v in value.items()}
     if isinstance(value, (tuple, list)):
         return type(value)(_serialize_value(v) for v in value)
-    return value
+    if isinstance(value, (int, float, bool, str, type(None))):
+        return value
+    return f"<{type(value).__name__}>"
 
 
 def _build_input_dict(args: tuple, kwargs: dict) -> Dict[str, Any]:
@@ -191,9 +195,9 @@ def _get_call_dir(op_name: str) -> Tuple[str, int, int]:
 
 def _dump_input(op_name: str, args: tuple, kwargs: dict) -> None:
     """Save operator inputs to disk."""
-    op_dir, call_num, order = _get_call_dir(op_name)
-    path = os.path.join(op_dir, f"order_{order:06d}_call_{call_num:04d}_input.pt")
     try:
+        op_dir, call_num, order = _get_call_dir(op_name)
+        path = os.path.join(op_dir, f"order_{order:06d}_call_{call_num:04d}_input.pt")
         data = _build_input_dict(args, kwargs)
         data["__meta__"] = {"op_name": op_name, "exec_order": order, "call_num": call_num}
         torch.save(data, path)
@@ -204,12 +208,12 @@ def _dump_input(op_name: str, args: tuple, kwargs: dict) -> None:
 
 def _dump_output(op_name: str, result: Any) -> None:
     """Save operator outputs to disk."""
-    count = _call_counters.get(op_name, 1)
-    step_dir = os.path.join(_dump_dir, f"step_{_step_counter:04d}")
-    op_dir = os.path.join(step_dir, op_name)
-    order = _last_exec_order.get(op_name, 0)
-    path = os.path.join(op_dir, f"order_{order:06d}_call_{count:04d}_output.pt")
     try:
+        count = _call_counters.get(op_name, 1)
+        step_dir = os.path.join(_dump_dir, f"step_{_step_counter:04d}")
+        op_dir = os.path.join(step_dir, op_name)
+        order = _last_exec_order.get(op_name, 0)
+        path = os.path.join(op_dir, f"order_{order:06d}_call_{count:04d}_output.pt")
         data = _build_output_dict(result)
         data["__meta__"] = {"op_name": op_name, "exec_order": order, "call_num": count}
         torch.save(data, path)
@@ -228,16 +232,28 @@ def is_dump_enabled() -> bool:
 
 def dump_before(op_name: str, args: tuple, kwargs: dict) -> None:
     """Dump operator inputs (called from OpManager)."""
+    if guard_active():
+        return
     if not _should_dump(op_name, args):
         return
-    _dump_input(op_name, args, kwargs)
+    set_guard(True)
+    try:
+        _dump_input(op_name, args, kwargs)
+    finally:
+        set_guard(False)
 
 
 def dump_after(op_name: str, args: tuple, result: Any) -> None:
     """Dump operator outputs (called from OpManager)."""
+    if guard_active():
+        return
     if not _should_dump(op_name, args):
         return
-    _dump_output(op_name, result)
+    set_guard(True)
+    try:
+        _dump_output(op_name, result)
+    finally:
+        set_guard(False)
 
 
 def io_dump_step() -> int:
@@ -307,24 +323,7 @@ def enable_io_dump(
 
 def disable_io_dump() -> None:
     """Programmatically disable IO dumping and remove all hooks."""
-    global _enabled, _dump_dir, _match_all, _op_filter, _module_filter, _dump_all
-    global _max_calls, _step_range, _step_counter
-    global _torch_funcs_enabled, _torch_func_filter
-
-    _enabled = False
-    _dump_dir = ""
-    _match_all = False
-    _dump_all = False
-    _op_filter = set()
-    _module_filter = set()
-    _max_calls = 0
-    _step_range = None
-    _torch_funcs_enabled = False
-    _torch_func_filter = set()
-    with _lock:
-        _step_counter = 0
-        _call_counters.clear()
-        _last_exec_order.clear()
+    _reset_state()
     _deactivate_hooks()
     remove_dump_hooks()
 
@@ -507,6 +506,28 @@ def remove_dump_hooks() -> None:
 # ── Environment Initialization ──
 
 
+def _reset_state() -> None:
+    """Reset all module-level state to defaults."""
+    global _enabled, _dump_dir, _match_all, _op_filter, _module_filter, _dump_all
+    global _max_calls, _step_range, _step_counter
+    global _torch_funcs_enabled, _torch_func_filter
+
+    _enabled = False
+    _dump_dir = ""
+    _match_all = False
+    _dump_all = False
+    _op_filter = set()
+    _module_filter = set()
+    _max_calls = 0
+    _step_range = None
+    _torch_funcs_enabled = False
+    _torch_func_filter = set()
+    with _lock:
+        _step_counter = 0
+        _call_counters.clear()
+        _last_exec_order.clear()
+
+
 def _init_from_env() -> None:
     """Initialize from VLLM_FL_IO_DUMP* environment variables or YAML config."""
     global _enabled, _dump_dir, _match_all, _op_filter, _module_filter, _dump_all
@@ -521,7 +542,7 @@ def _init_from_env() -> None:
         if io_cfg is not None:
             # YAML config is authoritative — if section exists, use it
             if not io_cfg.get("dir"):
-                _enabled = False
+                _reset_state()
                 return
             _dump_dir = io_cfg["dir"]
             os.makedirs(_dump_dir, exist_ok=True)
@@ -559,7 +580,7 @@ def _init_from_env() -> None:
     # Priority 2: Environment variables
     dump_dir = os.environ.get("VLLM_FL_IO_DUMP", "").strip()
     if not dump_dir:
-        _enabled = False
+        _reset_state()
         return
 
     _dump_dir = dump_dir
