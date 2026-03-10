@@ -104,6 +104,19 @@ from .discovery import (
     PLUGIN_MODULES_ENV,
 )
 from .logger_manager import get_logger, set_log_level
+from .io_inspector import (
+    enable_io_inspect,
+    disable_io_inspect,
+    attach_io_hooks,
+    remove_io_hooks,
+)
+from .io_dumper import (
+    enable_io_dump,
+    disable_io_dump,
+    io_dump_step,
+    attach_dump_hooks,
+    remove_dump_hooks,
+)
 
 
 def call_op(op_name: str, *args, **kwargs):
@@ -172,6 +185,16 @@ __all__ = [
     # Logging
     "get_logger",
     "set_log_level",
+    # IO Inspect & Dump
+    "enable_io_inspect",
+    "disable_io_inspect",
+    "attach_io_hooks",
+    "remove_io_hooks",
+    "enable_io_dump",
+    "disable_io_dump",
+    "io_dump_step",
+    "attach_dump_hooks",
+    "remove_dump_hooks",
     # Convenience functions
     "call_op",
     "resolve_op",

@@ -15,6 +15,16 @@ from typing import Callable, Dict, Optional, Set, Tuple
 from .registry import OpRegistry
 from .policy import SelectionPolicy, get_policy
 from .types import OpImpl, BackendImplKind, match_token
+from .io_inspector import (
+    inspect_before,
+    inspect_after,
+    is_inspect_enabled,
+)
+from .io_dumper import (
+    dump_before,
+    dump_after,
+    is_dump_enabled,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -388,6 +398,28 @@ class OpManager:
 
         return unique_candidates
 
+    def _call_with_hooks(self, op_name: str, fn, args: tuple, kwargs: dict):
+        """Call fn, wrapping with IO inspect/dump hooks only when enabled."""
+        do_inspect = is_inspect_enabled()
+        do_dump = is_dump_enabled()
+
+        if not do_inspect and not do_dump:
+            return fn(*args, **kwargs)
+
+        if do_inspect:
+            inspect_before(op_name, args, kwargs)
+        if do_dump:
+            dump_before(op_name, args, kwargs)
+
+        result = fn(*args, **kwargs)
+
+        if do_inspect:
+            inspect_after(op_name, args, result)
+        if do_dump:
+            dump_after(op_name, args, result)
+
+        return result
+
     def call(self, op_name: str, *args, **kwargs):
         """
         Resolve and call an operator implementation with optional fallback support.
@@ -439,9 +471,7 @@ class OpManager:
                                 break
                         self._called_ops[op_name] = impl_id
 
-            return fn(*args, **kwargs)
-
-        # Fallback mode: try candidates in priority order
+            return self._call_with_hooks(op_name, fn, args, kwargs)
         candidates = self.resolve_candidates(op_name)
         last_error = None
 
@@ -487,7 +517,7 @@ class OpManager:
                         f"(kind={impl.kind.value}, vendor={impl.vendor})"
                     )
 
-                result = impl.fn(*args, **kwargs)
+                result = self._call_with_hooks(op_name, impl.fn, args, kwargs)
 
                 # Update tracked impl_id on success (for fallback case)
                 if idx > 0:
