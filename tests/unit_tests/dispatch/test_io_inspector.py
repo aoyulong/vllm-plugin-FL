@@ -12,7 +12,14 @@ import pytest
 import torch
 
 from vllm_fl.dispatch import io_inspector
+from vllm_fl.dispatch._io_common import (
+    next_exec_order,
+    parse_io_config_from_yaml,
+    reset_exec_order,
+)
 from vllm_fl.dispatch.io_inspector import (
+    _HAS_GLOBAL_MODULE_HOOKS,
+    _HAS_TORCH_FUNC_MODE,
     _format_result,
     _format_value,
     _get_module_name,
@@ -20,8 +27,6 @@ from vllm_fl.dispatch.io_inspector import (
     _parse_torch_funcs_config,
     _should_inspect,
     _should_inspect_torch_func,
-    _HAS_GLOBAL_MODULE_HOOKS,
-    _HAS_TORCH_FUNC_MODE,
     attach_io_hooks,
     disable_io_inspect,
     enable_io_inspect,
@@ -29,12 +34,6 @@ from vllm_fl.dispatch.io_inspector import (
     inspect_before,
     is_inspect_enabled,
     remove_io_hooks,
-)
-from vllm_fl.dispatch._io_common import (
-    get_exec_order,
-    next_exec_order,
-    parse_io_config_from_yaml,
-    reset_exec_order,
 )
 
 
@@ -74,17 +73,13 @@ class TestParseConfig:
         assert modules == {"RMSNormFL", "SiluAndMulFL"}
 
     def test_mixed(self):
-        inspect_all, ops, modules = _parse_config(
-            "rms_norm,module:RotaryEmbeddingFL"
-        )
+        inspect_all, ops, modules = _parse_config("rms_norm,module:RotaryEmbeddingFL")
         assert not inspect_all
         assert ops == {"rms_norm"}
         assert modules == {"RotaryEmbeddingFL"}
 
     def test_whitespace_handling(self):
-        inspect_all, ops, modules = _parse_config(
-            " silu_and_mul , module:RMSNormFL "
-        )
+        inspect_all, ops, modules = _parse_config(" silu_and_mul , module:RMSNormFL ")
         assert ops == {"silu_and_mul"}
         assert modules == {"RMSNormFL"}
 
@@ -360,6 +355,7 @@ class TestForwardHooks:
         disable_io_inspect()
         # Hooks should be removed
         from vllm_fl.dispatch.io_inspector import _hook_handles
+
         assert len(_hook_handles) == 0
 
 
@@ -442,6 +438,7 @@ class TestGlobalModuleHooks:
     def test_global_hooks_auto_registered(self):
         enable_io_inspect(modules={"Linear"})
         from vllm_fl.dispatch.io_inspector import _global_hook_handles
+
         assert len(_global_hook_handles) == 2  # pre + post
 
     @pytest.mark.skipif(
@@ -469,6 +466,7 @@ class TestGlobalModuleHooks:
     def test_global_hooks_removed_on_disable(self):
         enable_io_inspect()
         from vllm_fl.dispatch.io_inspector import _global_hook_handles
+
         assert len(_global_hook_handles) == 2
         disable_io_inspect()
         assert len(_global_hook_handles) == 0
@@ -514,6 +512,7 @@ class TestTorchFunctionMode:
     def test_torch_func_mode_activated(self):
         enable_io_inspect(torch_funcs=True)
         from vllm_fl.dispatch.io_inspector import _torch_func_mode_instance
+
         assert _torch_func_mode_instance is not None
 
     @pytest.mark.skipif(
@@ -524,6 +523,7 @@ class TestTorchFunctionMode:
         enable_io_inspect(torch_funcs=True)
         disable_io_inspect()
         from vllm_fl.dispatch.io_inspector import _torch_func_mode_instance
+
         assert _torch_func_mode_instance is None
 
     @pytest.mark.skipif(
@@ -552,6 +552,7 @@ class TestTorchFunctionMode:
     def test_torch_func_mode_not_activated_by_default(self):
         enable_io_inspect()  # torch_funcs=False by default
         from vllm_fl.dispatch.io_inspector import _torch_func_mode_instance
+
         assert _torch_func_mode_instance is None
 
     @pytest.mark.skipif(
@@ -660,9 +661,7 @@ io_inspect:
     - Linear
   torch_funcs: true
 """
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".yaml", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write(cfg_content)
             cfg_path = f.name
 
@@ -688,9 +687,7 @@ io_dump:
   ops:
     - silu_and_mul
 """
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".yaml", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write(cfg_content)
             cfg_path = f.name
 
@@ -713,9 +710,7 @@ io_inspect:
   modules:
     - Linear
 """
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".yaml", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write(cfg_content)
             cfg_path = f.name
 
@@ -735,9 +730,7 @@ io_inspect:
 io_inspect:
   enabled: false
 """
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".yaml", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write(cfg_content)
             cfg_path = f.name
 

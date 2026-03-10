@@ -13,16 +13,21 @@ import pytest
 import torch
 
 from vllm_fl.dispatch import io_dumper
+from vllm_fl.dispatch._io_common import (
+    get_exec_order,
+    next_exec_order,
+    parse_io_config_from_yaml,
+    reset_exec_order,
+)
 from vllm_fl.dispatch.io_dumper import (
+    _HAS_GLOBAL_MODULE_HOOKS,
+    _HAS_TORCH_FUNC_MODE,
     _build_input_dict,
     _build_output_dict,
-    _get_module_name,
     _parse_torch_funcs_config,
     _serialize_value,
     _should_dump,
     _should_dump_torch_func,
-    _HAS_GLOBAL_MODULE_HOOKS,
-    _HAS_TORCH_FUNC_MODE,
     attach_dump_hooks,
     disable_io_dump,
     dump_after,
@@ -31,12 +36,6 @@ from vllm_fl.dispatch.io_dumper import (
     io_dump_step,
     is_dump_enabled,
     remove_dump_hooks,
-)
-from vllm_fl.dispatch._io_common import (
-    get_exec_order,
-    next_exec_order,
-    parse_io_config_from_yaml,
-    reset_exec_order,
 )
 
 
@@ -465,6 +464,7 @@ class TestForwardDumpHooks:
         attach_dump_hooks(model)
         disable_io_dump()
         from vllm_fl.dispatch.io_dumper import _hook_handles
+
         assert len(_hook_handles) == 0
 
 
@@ -540,6 +540,7 @@ class TestGlobalModuleHooks:
     def test_global_hooks_auto_registered(self, dump_dir):
         enable_io_dump(dump_dir, modules={"Linear"})
         from vllm_fl.dispatch.io_dumper import _global_hook_handles
+
         assert len(_global_hook_handles) == 2  # pre + post
 
     @pytest.mark.skipif(
@@ -571,6 +572,7 @@ class TestGlobalModuleHooks:
     def test_global_hooks_removed_on_disable(self, dump_dir):
         enable_io_dump(dump_dir)
         from vllm_fl.dispatch.io_dumper import _global_hook_handles
+
         assert len(_global_hook_handles) == 2
         disable_io_dump()
         assert len(_global_hook_handles) == 0
@@ -592,6 +594,7 @@ class TestDumpTorchFunctionMode:
     def test_torch_func_mode_activated(self, dump_dir):
         enable_io_dump(dump_dir, torch_funcs=True)
         from vllm_fl.dispatch.io_dumper import _torch_func_mode_instance
+
         assert _torch_func_mode_instance is not None
 
     @pytest.mark.skipif(
@@ -602,6 +605,7 @@ class TestDumpTorchFunctionMode:
         enable_io_dump(dump_dir, torch_funcs=True)
         disable_io_dump()
         from vllm_fl.dispatch.io_dumper import _torch_func_mode_instance
+
         assert _torch_func_mode_instance is None
 
     @pytest.mark.skipif(
@@ -632,6 +636,7 @@ class TestDumpTorchFunctionMode:
     def test_torch_func_mode_not_activated_by_default(self, dump_dir):
         enable_io_dump(dump_dir)  # torch_funcs=False by default
         from vllm_fl.dispatch.io_dumper import _torch_func_mode_instance
+
         assert _torch_func_mode_instance is None
 
     @pytest.mark.skipif(
@@ -767,9 +772,7 @@ io_dump:
   step_range: [2, 10]
   torch_funcs: true
 """
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".yaml", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write(cfg_content)
             cfg_path = f.name
 
@@ -799,9 +802,7 @@ io_dump:
     - matmul
     - softmax
 """
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".yaml", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write(cfg_content)
             cfg_path = f.name
 
@@ -823,9 +824,7 @@ io_dump:
     - rms_norm
   max_calls: 10
 """
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".yaml", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write(cfg_content)
             cfg_path = f.name
 
