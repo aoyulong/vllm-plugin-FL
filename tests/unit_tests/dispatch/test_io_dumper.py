@@ -14,17 +14,17 @@ import torch
 
 from vllm_fl.dispatch import io_dumper
 from vllm_fl.dispatch._io_common import (
+    HAS_GLOBAL_MODULE_HOOKS,
+    HAS_TORCH_FUNC_MODE,
     get_exec_order,
     next_exec_order,
     parse_io_config_from_yaml,
+    parse_torch_funcs_config,
     reset_exec_order,
 )
 from vllm_fl.dispatch.io_dumper import (
-    _HAS_GLOBAL_MODULE_HOOKS,
-    _HAS_TORCH_FUNC_MODE,
     _build_input_dict,
     _build_output_dict,
-    _parse_torch_funcs_config,
     _serialize_value,
     _should_dump,
     _should_dump_torch_func,
@@ -32,6 +32,7 @@ from vllm_fl.dispatch.io_dumper import (
     disable_io_dump,
     dump_after,
     dump_before,
+    dump_cleanup,
     enable_io_dump,
     io_dump_step,
     is_dump_enabled,
@@ -339,7 +340,7 @@ class TestEnvVarInit:
         io_dumper._init_from_env()
         assert is_dump_enabled()
         assert io_dumper._dump_dir == "/tmp/test_dump"
-        assert io_dumper._dump_all
+        assert io_dumper._match_all
 
     @patch.dict(
         os.environ,
@@ -352,7 +353,7 @@ class TestEnvVarInit:
     def test_env_ops(self):
         io_dumper._init_from_env()
         assert io_dumper._op_filter == {"rms_norm", "silu_and_mul"}
-        assert not io_dumper._dump_all
+        assert not io_dumper._match_all
 
     @patch.dict(
         os.environ,
@@ -469,25 +470,25 @@ class TestForwardDumpHooks:
 
 
 class TestParseTorchFuncsConfig:
-    """Test _parse_torch_funcs_config parsing logic."""
+    """Test parse_torch_funcs_config parsing logic."""
 
     def test_empty_string(self):
-        enabled, funcs = _parse_torch_funcs_config("")
+        enabled, funcs = parse_torch_funcs_config("")
         assert not enabled
         assert funcs == set()
 
     def test_zero_disables(self):
-        enabled, funcs = _parse_torch_funcs_config("0")
+        enabled, funcs = parse_torch_funcs_config("0")
         assert not enabled
         assert funcs == set()
 
     def test_one_enables_all(self):
-        enabled, funcs = _parse_torch_funcs_config("1")
+        enabled, funcs = parse_torch_funcs_config("1")
         assert enabled
         assert funcs == set()
 
     def test_specific_funcs(self):
-        enabled, funcs = _parse_torch_funcs_config("matmul,softmax")
+        enabled, funcs = parse_torch_funcs_config("matmul,softmax")
         assert enabled
         assert funcs == {"matmul", "softmax"}
 
@@ -534,7 +535,7 @@ class TestGlobalModuleHooks:
         disable_io_dump()
 
     @pytest.mark.skipif(
-        not _HAS_GLOBAL_MODULE_HOOKS,
+        not HAS_GLOBAL_MODULE_HOOKS,
         reason="Global module hooks not available in this PyTorch version",
     )
     def test_global_hooks_auto_registered(self, dump_dir):
@@ -544,7 +545,7 @@ class TestGlobalModuleHooks:
         assert len(_global_hook_handles) == 2  # pre + post
 
     @pytest.mark.skipif(
-        not _HAS_GLOBAL_MODULE_HOOKS,
+        not HAS_GLOBAL_MODULE_HOOKS,
         reason="Global module hooks not available in this PyTorch version",
     )
     def test_global_hooks_create_files_without_attach(self, dump_dir):
@@ -566,7 +567,7 @@ class TestGlobalModuleHooks:
         assert found_pt
 
     @pytest.mark.skipif(
-        not _HAS_GLOBAL_MODULE_HOOKS,
+        not HAS_GLOBAL_MODULE_HOOKS,
         reason="Global module hooks not available in this PyTorch version",
     )
     def test_global_hooks_removed_on_disable(self, dump_dir):
@@ -588,7 +589,7 @@ class TestDumpTorchFunctionMode:
         disable_io_dump()
 
     @pytest.mark.skipif(
-        not _HAS_TORCH_FUNC_MODE,
+        not HAS_TORCH_FUNC_MODE,
         reason="TorchFunctionMode not available in this PyTorch version",
     )
     def test_torch_func_mode_activated(self, dump_dir):
@@ -598,7 +599,7 @@ class TestDumpTorchFunctionMode:
         assert _torch_func_mode_instance is not None
 
     @pytest.mark.skipif(
-        not _HAS_TORCH_FUNC_MODE,
+        not HAS_TORCH_FUNC_MODE,
         reason="TorchFunctionMode not available in this PyTorch version",
     )
     def test_torch_func_mode_deactivated_on_disable(self, dump_dir):
@@ -609,7 +610,7 @@ class TestDumpTorchFunctionMode:
         assert _torch_func_mode_instance is None
 
     @pytest.mark.skipif(
-        not _HAS_TORCH_FUNC_MODE,
+        not HAS_TORCH_FUNC_MODE,
         reason="TorchFunctionMode not available in this PyTorch version",
     )
     def test_torch_func_mode_dumps_matmul(self, dump_dir):
@@ -630,7 +631,7 @@ class TestDumpTorchFunctionMode:
         assert found_pt
 
     @pytest.mark.skipif(
-        not _HAS_TORCH_FUNC_MODE,
+        not HAS_TORCH_FUNC_MODE,
         reason="TorchFunctionMode not available in this PyTorch version",
     )
     def test_torch_func_mode_not_activated_by_default(self, dump_dir):
@@ -640,7 +641,7 @@ class TestDumpTorchFunctionMode:
         assert _torch_func_mode_instance is None
 
     @pytest.mark.skipif(
-        not _HAS_TORCH_FUNC_MODE,
+        not HAS_TORCH_FUNC_MODE,
         reason="TorchFunctionMode not available in this PyTorch version",
     )
     def test_no_infinite_recursion(self, dump_dir):
@@ -838,3 +839,74 @@ io_dump:
             assert io_dumper._max_calls == 10
         finally:
             os.unlink(cfg_path)
+
+
+class TestDumpCleanup:
+    """Test dump_cleanup for stale pairing removal."""
+
+    def setup_method(self):
+        disable_io_dump()
+        reset_exec_order()
+
+    def teardown_method(self):
+        disable_io_dump()
+        reset_exec_order()
+
+    def test_cleanup_pops_stale_pairing(self, dump_dir):
+        enable_io_dump(dump_dir)
+        reset_exec_order()
+        t = torch.zeros(2)
+
+        # dump_before pushes pairing
+        dump_before("test_op", (t,), {})
+
+        # Simulate fn() raising — cleanup should pop the stale entry
+        dump_cleanup("test_op")
+
+        # dump_after should now find no pairing and log a warning (not crash)
+        dump_after("test_op", (t,), torch.ones(2))
+
+        # Only the input file should exist (no output file)
+        step_dir = os.path.join(dump_dir, "step_0000", "test_op")
+        input_files = [f for f in os.listdir(step_dir) if f.endswith("_input.pt")]
+        output_files = [f for f in os.listdir(step_dir) if f.endswith("_output.pt")]
+        assert len(input_files) == 1
+        assert len(output_files) == 0
+
+    def test_cleanup_noop_when_no_pairing(self):
+        # Should not raise even with nothing to clean up
+        dump_cleanup("nonexistent_op")
+
+
+class TestExecOrderParam:
+    """Test that pre-allocated exec_order flows through dump files."""
+
+    def setup_method(self):
+        disable_io_dump()
+        reset_exec_order()
+
+    def teardown_method(self):
+        disable_io_dump()
+        reset_exec_order()
+
+    def test_dump_before_uses_given_order(self, dump_dir):
+        enable_io_dump(dump_dir)
+        t = torch.zeros(2)
+
+        dump_before("test_op", (t,), {}, exec_order=99)
+
+        step_dir = os.path.join(dump_dir, "step_0000", "test_op")
+        input_files = [f for f in os.listdir(step_dir) if f.endswith("_input.pt")]
+        assert len(input_files) == 1
+        assert "order_000099" in input_files[0]
+
+        data = torch.load(os.path.join(step_dir, input_files[0]), weights_only=False)
+        assert data["__meta__"]["exec_order"] == 99
+
+    def test_dump_before_none_order_allocates_internally(self, dump_dir):
+        enable_io_dump(dump_dir)
+        reset_exec_order()
+        t = torch.zeros(2)
+
+        dump_before("test_op", (t,), {})  # exec_order=None
+        assert get_exec_order() >= 1

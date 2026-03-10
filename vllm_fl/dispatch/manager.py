@@ -23,8 +23,10 @@ from .io_inspector import (
 from .io_dumper import (
     dump_before,
     dump_after,
+    dump_cleanup,
     is_dump_enabled,
 )
+from ._io_common import next_exec_order
 
 
 logger = logging.getLogger(__name__)
@@ -401,6 +403,12 @@ class OpManager:
     def _call_with_hooks(self, op_name: str, fn, args: tuple, kwargs: dict):
         """Call fn, wrapping with IO inspect/dump hooks only when enabled.
 
+        A single execution-order number is allocated and shared between
+        the inspector and dumper so that log lines and dump files can be
+        correlated.  If ``fn`` raises, any dump pairing pushed by
+        ``dump_before`` is cleaned up to keep the thread-local stack
+        consistent.
+
         Hook failures are logged and swallowed so that diagnostic hooks
         never break the dispatched operator call.
         """
@@ -410,22 +418,34 @@ class OpManager:
         if not do_inspect and not do_dump:
             return fn(*args, **kwargs)
 
+        # Allocate a single exec_order shared by inspector and dumper
+        order = next_exec_order()
+
         if do_inspect:
             try:
-                inspect_before(op_name, args, kwargs)
+                inspect_before(op_name, args, kwargs, exec_order=order)
             except Exception as e:
                 logger.debug(f"inspect_before hook failed for '{op_name}': {e}")
         if do_dump:
             try:
-                dump_before(op_name, args, kwargs)
+                dump_before(op_name, args, kwargs, exec_order=order)
             except Exception as e:
                 logger.debug(f"dump_before hook failed for '{op_name}': {e}")
 
-        result = fn(*args, **kwargs)
+        try:
+            result = fn(*args, **kwargs)
+        except Exception:
+            # Clean up stale dump pairing so the stack stays consistent
+            if do_dump:
+                try:
+                    dump_cleanup(op_name)
+                except Exception:
+                    pass
+            raise
 
         if do_inspect:
             try:
-                inspect_after(op_name, args, result)
+                inspect_after(op_name, args, result, exec_order=order)
             except Exception as e:
                 logger.debug(f"inspect_after hook failed for '{op_name}': {e}")
         if do_dump:

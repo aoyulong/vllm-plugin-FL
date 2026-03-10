@@ -81,8 +81,6 @@ def format_value(value: Any) -> str:
             items = ", ".join(format_value(v) for v in value)
             return f"{type_name}([{items}])"
         return f"{type_name}(len={len(value)})"
-    if isinstance(value, torch.nn.Module):
-        return f"{type(value).__name__}(...)"
     return f"{type(value).__name__}(...)"
 
 
@@ -191,7 +189,7 @@ def parse_io_config_from_yaml(config_path: str) -> Dict[str, Any]:
     Expected YAML structure (all fields optional)::
 
         io_inspect:
-          enabled: true           # or "1", or "rms_norm,silu_and_mul"
+          enabled: true           # boolean: true/false
           ops:
             - rms_norm
             - silu_and_mul

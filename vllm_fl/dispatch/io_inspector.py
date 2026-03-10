@@ -59,14 +59,6 @@ if HAS_GLOBAL_MODULE_HOOKS:
 
 logger = get_logger("vllm_fl.dispatch.io_inspect")
 
-# Backward-compatible aliases for tests that import private names
-_format_value = format_value
-_format_result = format_result
-_get_module_name = get_module_class_name
-_parse_torch_funcs_config = parse_torch_funcs_config
-_HAS_TORCH_FUNC_MODE = HAS_TORCH_FUNC_MODE
-_HAS_GLOBAL_MODULE_HOOKS = HAS_GLOBAL_MODULE_HOOKS
-
 # ── Module-level state ──
 
 _enabled: bool = False
@@ -83,9 +75,6 @@ _torch_func_mode_instance: Optional[Any] = None
 
 
 # ── Filtering ──
-
-# Keep old name as alias for backward compat in tests
-_inspect_all = False
 
 
 def _should_inspect(op_name: str, args: tuple) -> bool:
@@ -154,9 +143,11 @@ def _log_inputs(label: str, args: tuple, kwargs: dict,
     logger.info("\n".join(lines))
 
 
-def _log_outputs(label: str, result: Any) -> None:
+def _log_outputs(label: str, result: Any,
+                 exec_order: Optional[int] = None) -> None:
     """Log operator/module outputs."""
-    logger.info(f"[IO_INSPECT] {label} OUTPUTS:\n{format_result(result)}")
+    order_str = f" #{exec_order}" if exec_order is not None else ""
+    logger.info(f"[IO_INSPECT]{order_str} {label} OUTPUTS:\n{format_result(result)}")
 
 
 # ── Public API ──
@@ -167,24 +158,49 @@ def is_inspect_enabled() -> bool:
     return _enabled
 
 
-def inspect_before(op_name: str, args: tuple, kwargs: dict) -> None:
-    """Log operator inputs before execution (called from OpManager)."""
+def inspect_before(op_name: str, args: tuple, kwargs: dict,
+                   exec_order: Optional[int] = None) -> None:
+    """Log operator inputs before execution (called from OpManager).
+
+    Args:
+        exec_order: Pre-allocated execution order number.  When called from
+            ``_call_with_hooks`` a single order is shared with the dumper so
+            that log lines and dump files can be correlated.  If *None*, an
+            order is allocated internally (standalone usage).
+    """
+    if guard_active():
+        return
     if not _should_inspect(op_name, args):
         return
-    order = next_exec_order()
+    order = exec_order if exec_order is not None else next_exec_order()
     module_name = get_module_class_name(args)
     module_str = f" (module={module_name})" if module_name else ""
-    _log_inputs(f"Op '{op_name}'{module_str}", args, kwargs,
-                skip_module_arg=True, exec_order=order)
+    set_guard(True)
+    try:
+        _log_inputs(f"Op '{op_name}'{module_str}", args, kwargs,
+                    skip_module_arg=True, exec_order=order)
+    finally:
+        set_guard(False)
 
 
-def inspect_after(op_name: str, args: tuple, result: Any) -> None:
-    """Log operator outputs after execution (called from OpManager)."""
+def inspect_after(op_name: str, args: tuple, result: Any,
+                  exec_order: Optional[int] = None) -> None:
+    """Log operator outputs after execution (called from OpManager).
+
+    Args:
+        exec_order: Pre-allocated execution order (for log correlation).
+    """
+    if guard_active():
+        return
     if not _should_inspect(op_name, args):
         return
     module_name = get_module_class_name(args)
     module_str = f" (module={module_name})" if module_name else ""
-    _log_outputs(f"Op '{op_name}'{module_str}", result)
+    set_guard(True)
+    try:
+        _log_outputs(f"Op '{op_name}'{module_str}", result, exec_order=exec_order)
+    finally:
+        set_guard(False)
 
 
 def enable_io_inspect(
@@ -204,7 +220,7 @@ def enable_io_inspect(
         modules: nn.Module class names to inspect. None = all.
         torch_funcs: Also intercept bare torch functional ops.
     """
-    global _enabled, _match_all, _op_filter, _module_filter, _inspect_all
+    global _enabled, _match_all, _op_filter, _module_filter
     global _torch_funcs_enabled, _torch_func_filter
 
     if ops is None and modules is None:
@@ -216,12 +232,17 @@ def enable_io_inspect(
         _op_filter = set(ops) if ops else set()
         _module_filter = set(modules) if modules else set()
 
-    _inspect_all = _match_all  # backward compat alias
     _torch_funcs_enabled = torch_funcs
     _torch_func_filter = set()
     _enabled = True
 
     _activate_hooks()
+
+    logger.info(
+        f"IO Inspect enabled: "
+        f"ops={_op_filter or 'all'}, modules={_module_filter or 'all'}, "
+        f"torch_funcs={_torch_funcs_enabled}"
+    )
 
 
 def disable_io_inspect() -> None:
@@ -289,7 +310,7 @@ if HAS_TORCH_FUNC_MODE:
 
             set_guard(True)
             try:
-                _log_outputs(label, result)
+                _log_outputs(label, result, exec_order=order)
             finally:
                 set_guard(False)
 
@@ -349,7 +370,7 @@ def _make_pre_hook(name: str):
         if guard_active():
             return
         cls_name = type(module).__name__
-        label = f"{cls_name}({name})" if name else cls_name
+        label = f"{name} ({cls_name})" if name else cls_name
         order = next_exec_order()
         set_guard(True)
         try:
@@ -364,7 +385,7 @@ def _make_post_hook(name: str):
         if guard_active():
             return
         cls_name = type(module).__name__
-        label = f"{cls_name}({name})" if name else cls_name
+        label = f"{name} ({cls_name})" if name else cls_name
         set_guard(True)
         try:
             _log_outputs(f"Module '{label}'", output)
@@ -405,12 +426,11 @@ def remove_io_hooks() -> None:
 
 def _reset_state() -> None:
     """Reset all module-level state to defaults."""
-    global _enabled, _match_all, _op_filter, _module_filter, _inspect_all
+    global _enabled, _match_all, _op_filter, _module_filter
     global _torch_funcs_enabled, _torch_func_filter
 
     _enabled = False
     _match_all = False
-    _inspect_all = False
     _op_filter = set()
     _module_filter = set()
     _torch_funcs_enabled = False
@@ -422,7 +442,7 @@ def _reset_state() -> None:
 
 def _init_from_env() -> None:
     """Initialize from VLLM_FL_IO_INSPECT* environment variables or YAML config."""
-    global _enabled, _match_all, _op_filter, _module_filter, _inspect_all
+    global _enabled, _match_all, _op_filter, _module_filter
     global _torch_funcs_enabled, _torch_func_filter
 
     # Reset state first
@@ -447,7 +467,6 @@ def _init_from_env() -> None:
                 _match_all = False
                 _op_filter = set(ops)
                 _module_filter = set(modules)
-            _inspect_all = _match_all
             tf_enabled, tf_filter = io_cfg.get("torch_funcs", (False, set()))
             _torch_funcs_enabled = tf_enabled
             _torch_func_filter = tf_filter
@@ -468,7 +487,6 @@ def _init_from_env() -> None:
         return
 
     _match_all, _op_filter, _module_filter = _parse_config(env_val)
-    _inspect_all = _match_all
     _enabled = _match_all or bool(_op_filter) or bool(_module_filter)
 
     torch_funcs_val = os.environ.get("VLLM_FL_IO_INSPECT_TORCH_FUNCS", "")

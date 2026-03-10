@@ -13,18 +13,18 @@ import torch
 
 from vllm_fl.dispatch import io_inspector
 from vllm_fl.dispatch._io_common import (
+    HAS_GLOBAL_MODULE_HOOKS,
+    HAS_TORCH_FUNC_MODE,
+    format_result,
+    format_value,
+    get_module_class_name,
     next_exec_order,
     parse_io_config_from_yaml,
+    parse_torch_funcs_config,
     reset_exec_order,
 )
 from vllm_fl.dispatch.io_inspector import (
-    _HAS_GLOBAL_MODULE_HOOKS,
-    _HAS_TORCH_FUNC_MODE,
-    _format_result,
-    _format_value,
-    _get_module_name,
     _parse_config,
-    _parse_torch_funcs_config,
     _should_inspect,
     _should_inspect_torch_func,
     attach_io_hooks,
@@ -85,69 +85,69 @@ class TestParseConfig:
 
 
 class TestFormatValue:
-    """Test _format_value formatting."""
+    """Test format_value formatting."""
 
     def test_tensor(self):
         t = torch.zeros(4, 512, dtype=torch.float16)
-        result = _format_value(t)
+        result = format_value(t)
         assert "shape=[4, 512]" in result
         assert "float16" in result
 
     def test_none(self):
-        assert _format_value(None) == "None"
+        assert format_value(None) == "None"
 
     def test_int(self):
-        assert _format_value(42) == "42"
+        assert format_value(42) == "42"
 
     def test_float(self):
-        assert _format_value(1.5) == "1.5"
+        assert format_value(1.5) == "1.5"
 
     def test_bool(self):
-        assert _format_value(True) == "True"
+        assert format_value(True) == "True"
 
     def test_small_tuple(self):
-        result = _format_value((1, 2, 3))
+        result = format_value((1, 2, 3))
         assert "tuple" in result
 
     def test_large_tuple(self):
-        result = _format_value((1, 2, 3, 4, 5))
+        result = format_value((1, 2, 3, 4, 5))
         assert "len=5" in result
 
     def test_module(self):
         m = torch.nn.Linear(10, 10)
-        result = _format_value(m)
+        result = format_value(m)
         assert "Linear" in result
 
 
 class TestFormatResult:
-    """Test _format_result formatting."""
+    """Test format_result formatting."""
 
     def test_single_tensor(self):
         t = torch.zeros(2, 3)
-        result = _format_result(t)
+        result = format_result(t)
         assert "result:" in result
         assert "shape=[2, 3]" in result
 
     def test_tuple_result(self):
         t1 = torch.zeros(2, 3)
         t2 = torch.ones(4, 5)
-        result = _format_result((t1, t2))
+        result = format_result((t1, t2))
         assert "result[0]:" in result
         assert "result[1]:" in result
 
 
 class TestGetModuleName:
-    """Test _get_module_name extraction."""
+    """Test get_module_class_name extraction."""
 
     def test_with_module(self):
         m = torch.nn.Linear(10, 10)
-        assert _get_module_name((m, torch.zeros(2))) == "Linear"
+        assert get_module_class_name((m, torch.zeros(2))) == "Linear"
 
     def test_without_module(self):
-        assert _get_module_name((torch.zeros(2),)) is None
+        assert get_module_class_name((torch.zeros(2),)) is None
 
     def test_empty_args(self):
-        assert _get_module_name(()) is None
+        assert get_module_class_name(()) is None
 
 
 class TestShouldInspect:
@@ -220,7 +220,7 @@ class TestEnvVarInit:
     def test_env_all(self):
         io_inspector._init_from_env()
         assert is_inspect_enabled()
-        assert io_inspector._inspect_all
+        assert io_inspector._match_all
 
     @patch.dict(os.environ, {"VLLM_FL_IO_INSPECT": "rms_norm,silu_and_mul"})
     def test_env_ops(self):
@@ -360,30 +360,30 @@ class TestForwardHooks:
 
 
 class TestParseTorchFuncsConfig:
-    """Test _parse_torch_funcs_config parsing logic."""
+    """Test parse_torch_funcs_config parsing logic."""
 
     def test_empty_string(self):
-        enabled, funcs = _parse_torch_funcs_config("")
+        enabled, funcs = parse_torch_funcs_config("")
         assert not enabled
         assert funcs == set()
 
     def test_zero_disables(self):
-        enabled, funcs = _parse_torch_funcs_config("0")
+        enabled, funcs = parse_torch_funcs_config("0")
         assert not enabled
         assert funcs == set()
 
     def test_one_enables_all(self):
-        enabled, funcs = _parse_torch_funcs_config("1")
+        enabled, funcs = parse_torch_funcs_config("1")
         assert enabled
         assert funcs == set()
 
     def test_specific_funcs(self):
-        enabled, funcs = _parse_torch_funcs_config("matmul,softmax")
+        enabled, funcs = parse_torch_funcs_config("matmul,softmax")
         assert enabled
         assert funcs == {"matmul", "softmax"}
 
     def test_whitespace(self):
-        enabled, funcs = _parse_torch_funcs_config(" matmul , linear ")
+        enabled, funcs = parse_torch_funcs_config(" matmul , linear ")
         assert enabled
         assert funcs == {"matmul", "linear"}
 
@@ -432,7 +432,7 @@ class TestGlobalModuleHooks:
         disable_io_inspect()
 
     @pytest.mark.skipif(
-        not _HAS_GLOBAL_MODULE_HOOKS,
+        not HAS_GLOBAL_MODULE_HOOKS,
         reason="Global module hooks not available in this PyTorch version",
     )
     def test_global_hooks_auto_registered(self):
@@ -442,7 +442,7 @@ class TestGlobalModuleHooks:
         assert len(_global_hook_handles) == 2  # pre + post
 
     @pytest.mark.skipif(
-        not _HAS_GLOBAL_MODULE_HOOKS,
+        not HAS_GLOBAL_MODULE_HOOKS,
         reason="Global module hooks not available in this PyTorch version",
     )
     def test_global_hooks_fire_without_attach(self, caplog):
@@ -460,7 +460,7 @@ class TestGlobalModuleHooks:
         assert any("OUTPUTS" in r.message for r in caplog.records)
 
     @pytest.mark.skipif(
-        not _HAS_GLOBAL_MODULE_HOOKS,
+        not HAS_GLOBAL_MODULE_HOOKS,
         reason="Global module hooks not available in this PyTorch version",
     )
     def test_global_hooks_removed_on_disable(self):
@@ -472,7 +472,7 @@ class TestGlobalModuleHooks:
         assert len(_global_hook_handles) == 0
 
     @pytest.mark.skipif(
-        not _HAS_GLOBAL_MODULE_HOOKS,
+        not HAS_GLOBAL_MODULE_HOOKS,
         reason="Global module hooks not available in this PyTorch version",
     )
     def test_global_hooks_filter_by_module(self, caplog):
@@ -506,7 +506,7 @@ class TestTorchFunctionMode:
         disable_io_inspect()
 
     @pytest.mark.skipif(
-        not _HAS_TORCH_FUNC_MODE,
+        not HAS_TORCH_FUNC_MODE,
         reason="TorchFunctionMode not available in this PyTorch version",
     )
     def test_torch_func_mode_activated(self):
@@ -516,7 +516,7 @@ class TestTorchFunctionMode:
         assert _torch_func_mode_instance is not None
 
     @pytest.mark.skipif(
-        not _HAS_TORCH_FUNC_MODE,
+        not HAS_TORCH_FUNC_MODE,
         reason="TorchFunctionMode not available in this PyTorch version",
     )
     def test_torch_func_mode_deactivated_on_disable(self):
@@ -527,7 +527,7 @@ class TestTorchFunctionMode:
         assert _torch_func_mode_instance is None
 
     @pytest.mark.skipif(
-        not _HAS_TORCH_FUNC_MODE,
+        not HAS_TORCH_FUNC_MODE,
         reason="TorchFunctionMode not available in this PyTorch version",
     )
     def test_torch_func_mode_captures_matmul(self, caplog):
@@ -546,7 +546,7 @@ class TestTorchFunctionMode:
         assert "OUTPUTS" in messages
 
     @pytest.mark.skipif(
-        not _HAS_TORCH_FUNC_MODE,
+        not HAS_TORCH_FUNC_MODE,
         reason="TorchFunctionMode not available in this PyTorch version",
     )
     def test_torch_func_mode_not_activated_by_default(self):
@@ -556,7 +556,7 @@ class TestTorchFunctionMode:
         assert _torch_func_mode_instance is None
 
     @pytest.mark.skipif(
-        not _HAS_TORCH_FUNC_MODE,
+        not HAS_TORCH_FUNC_MODE,
         reason="TorchFunctionMode not available in this PyTorch version",
     )
     def test_no_infinite_recursion(self):
@@ -741,3 +741,43 @@ io_inspect:
             assert not is_inspect_enabled()
         finally:
             os.unlink(cfg_path)
+
+
+class TestExecOrderParam:
+    """Test that pre-allocated exec_order is respected."""
+
+    def setup_method(self):
+        disable_io_inspect()
+        reset_exec_order()
+
+    def teardown_method(self):
+        disable_io_inspect()
+        reset_exec_order()
+
+    def test_inspect_before_uses_given_order(self, caplog):
+        import logging
+
+        enable_io_inspect()
+
+        with caplog.at_level(logging.INFO, logger="vllm_fl.dispatch.io_inspect"):
+            inspect_before("op", (torch.zeros(2),), {}, exec_order=42)
+
+        assert any("#42" in r.message for r in caplog.records)
+
+    def test_inspect_after_uses_given_order(self, caplog):
+        import logging
+
+        enable_io_inspect()
+
+        with caplog.at_level(logging.INFO, logger="vllm_fl.dispatch.io_inspect"):
+            inspect_after("op", (), torch.zeros(2), exec_order=42)
+
+        assert any("#42" in r.message for r in caplog.records)
+
+    def test_exec_order_none_allocates_internally(self):
+        enable_io_inspect()
+        reset_exec_order()
+        inspect_before("op", (torch.zeros(2),), {})
+        from vllm_fl.dispatch._io_common import get_exec_order
+
+        assert get_exec_order() >= 1
