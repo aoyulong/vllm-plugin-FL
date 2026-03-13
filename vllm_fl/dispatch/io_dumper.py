@@ -84,6 +84,7 @@ from ._io_common import (
     HAS_TORCH_FUNC_MODE,
     TorchFunctionMode,
     acquire_global_module_hooks,
+    acquire_torch_func_tags,
     advance_step,
     expand_layer_specs,
     get_module_class_name,
@@ -108,7 +109,7 @@ from ._io_common import (
     record_seen,
     register_step_callback,
     release_global_module_hooks,
-    reset_step,
+    release_torch_func_tags,
     set_rank_filter,
     should_inspect_torch_func,
     tensor_stats,
@@ -135,6 +136,10 @@ _meta_only: bool = True
 
 _call_counters: Dict[str, int] = {}
 _lock = threading.Lock()
+
+# Per-file locks for _append_to_json to prevent concurrent read-modify-write corruption
+_json_file_locks: Dict[str, threading.Lock] = {}
+_json_file_locks_guard = threading.Lock()
 
 # Thread-local storage for pairing dump_before → dump_after.
 # Each thread stores a dict of op_name → list of (call_num, exec_order, op_dir).
@@ -342,15 +347,30 @@ def _next_call_num(op_name: str) -> int:
         return count
 
 
+def _get_json_lock(json_path: str) -> threading.Lock:
+    """Get or create a per-file lock for JSON read-modify-write."""
+    with _json_file_locks_guard:
+        lock = _json_file_locks.get(json_path)
+        if lock is None:
+            lock = threading.Lock()
+            _json_file_locks[json_path] = lock
+        return lock
+
+
 def _append_to_json(json_path: str, key: str, value: dict) -> None:
-    """Add a key to a JSON file (read-modify-write). Creates file if needed."""
-    data: Dict[str, Any] = {}
-    if os.path.exists(json_path):
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    data[key] = value
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    """Add a key to a JSON file (read-modify-write). Creates file if needed.
+
+    Uses a per-file lock to prevent concurrent updates from corrupting the file.
+    """
+    lock = _get_json_lock(json_path)
+    with lock:
+        data: Dict[str, Any] = {}
+        if os.path.exists(json_path):
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        data[key] = value
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
 
 
 # ── Dump helpers ──
@@ -449,11 +469,17 @@ def is_dump_enabled() -> bool:
 
 
 def dump_before(op_name: str, args: tuple, kwargs: dict,
-                exec_order: Optional[int] = None) -> None:
+                exec_order: Optional[int] = None,
+                module_tag: Optional[str] = None,
+                op_tag: Optional[str] = None) -> None:
     """Dump operator inputs (called from OpManager).
 
     Args:
         exec_order: Pre-allocated execution order shared with the inspector.
+        module_tag: Pre-computed module counter tag (e.g. ``[module=0,1]``).
+            When *None*, generated internally.
+        op_tag: Pre-computed op counter tag (e.g. ``[op=3,2]``).
+            When *None*, generated internally.
     """
     if guard_active():
         return
@@ -462,13 +488,13 @@ def dump_before(op_name: str, args: tuple, kwargs: dict,
     if not _should_dump(op_name, args):
         return
     label = make_label(op_name, args)
-    module_tag = make_module_tag()
-    op_tag = make_op_tag(op_name)
+    _module_tag = module_tag if module_tag is not None else make_module_tag()
+    _op_tag = op_tag if op_tag is not None else make_op_tag(op_name)
     record_seen(op_name, args)
     set_guard(True)
     try:
         _dump_input(op_name, args, kwargs, exec_order=exec_order, label=label,
-                    module_tag=module_tag, op_tag=op_tag)
+                    module_tag=_module_tag, op_tag=_op_tag)
     finally:
         set_guard(False)
 
@@ -696,14 +722,13 @@ if HAS_TORCH_FUNC_MODE:
                 return func(*args, **kwargs)
 
             label = make_label(raw_name)
-            module_tag = make_module_tag()
-            op_tag = make_op_tag(raw_name)
+            module_tag, op_tag, order = acquire_torch_func_tags(raw_name)
             record_seen(raw_name)
 
             set_guard(True)
             try:
-                _dump_input(raw_name, args, kwargs, label=label,
-                            module_tag=module_tag, op_tag=op_tag)
+                _dump_input(raw_name, args, kwargs, exec_order=order,
+                            label=label, module_tag=module_tag, op_tag=op_tag)
             finally:
                 set_guard(False)
 
@@ -712,6 +737,7 @@ if HAS_TORCH_FUNC_MODE:
             except Exception:
                 # Clean up stale pairing pushed by _dump_input
                 _pop_pairing(raw_name)
+                release_torch_func_tags()
                 raise
 
             set_guard(True)
@@ -720,6 +746,7 @@ if HAS_TORCH_FUNC_MODE:
             finally:
                 set_guard(False)
 
+            release_torch_func_tags()
             return result
 
 
@@ -843,7 +870,6 @@ def _reset_state() -> None:
     _meta_only = True
     _torch_funcs_enabled = False
     _torch_func_filter = set()
-    reset_step()
     with _lock:
         _call_counters.clear()
 

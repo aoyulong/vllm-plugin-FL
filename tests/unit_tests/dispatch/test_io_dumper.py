@@ -215,10 +215,12 @@ class TestDumpBeforeAfter:
     """Test dump_before and dump_after file creation."""
 
     def setup_method(self):
+        reset_step()
         disable_io_dump()
 
     def teardown_method(self):
         disable_io_dump()
+        reset_step()
 
     def test_dump_creates_input_file(self, dump_dir):
         enable_io_dump(dump_dir, meta_only=False)
@@ -302,6 +304,7 @@ class TestIoDumpStep:
     """Test io_dump_step step counter management."""
 
     def setup_method(self):
+        reset_step()
         disable_io_dump()
 
     def teardown_method(self):
@@ -378,7 +381,9 @@ class TestProgrammaticAPI:
         assert io_dumper._dump_dir == ""
         assert io_dumper._op_filter == set()
         assert io_dumper._max_calls == 0
-        assert get_step() == 0
+        # Step counter is shared with inspector; disabling the dumper
+        # should NOT reset it (only explicit reset_step() should).
+        assert get_step() >= 1
 
 
 class TestEnvVarInit:
@@ -462,6 +467,7 @@ class TestForwardDumpHooks:
     """Test nn.Module forward hook attachment for dumping."""
 
     def setup_method(self):
+        reset_step()
         disable_io_dump()
 
     def teardown_method(self):
@@ -585,6 +591,7 @@ class TestGlobalModuleHooks:
     """Test automatic global module hook registration for dumping."""
 
     def setup_method(self):
+        reset_step()
         disable_io_dump()
 
     def teardown_method(self):
@@ -653,6 +660,7 @@ class TestDumpTorchFunctionMode:
     """Test TorchFunctionMode for bare torch functional ops dumping."""
 
     def setup_method(self):
+        reset_step()
         disable_io_dump()
 
     def teardown_method(self):
@@ -794,6 +802,7 @@ class TestExecOrder:
     """Test execution order tracking in dump files."""
 
     def setup_method(self):
+        reset_step()
         disable_io_dump()
         reset_exec_order()
 
@@ -944,6 +953,7 @@ class TestDumpCleanup:
     """Test dump_cleanup for stale pairing removal."""
 
     def setup_method(self):
+        reset_step()
         disable_io_dump()
         reset_exec_order()
 
@@ -981,6 +991,7 @@ class TestExecOrderParam:
     """Test that pre-allocated exec_order flows through dump files."""
 
     def setup_method(self):
+        reset_step()
         disable_io_dump()
         reset_exec_order()
 
@@ -1015,6 +1026,7 @@ class TestRankInDumper:
     """Test rank directory layout and metadata in dump files."""
 
     def setup_method(self):
+        reset_step()
         disable_io_dump()
         reset_exec_order()
         reset_rank()
@@ -1082,6 +1094,7 @@ class TestRankFilterInDumper:
     """Test rank filtering prevents dumping on non-matching ranks."""
 
     def setup_method(self):
+        reset_step()
         disable_io_dump()
         reset_exec_order()
         reset_rank()
@@ -1231,6 +1244,7 @@ class TestMetaOnly:
     """Test metadata-only dump mode."""
 
     def setup_method(self):
+        reset_step()
         disable_io_dump()
         reset_exec_order()
 
@@ -1327,6 +1341,7 @@ class TestLayerFilter:
     """Test layer path filtering for IO dumper."""
 
     def setup_method(self):
+        reset_step()
         disable_io_dump()
         reset_exec_order()
         self.model = torch.nn.Sequential(

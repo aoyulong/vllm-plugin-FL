@@ -26,7 +26,7 @@ from .io_dumper import (
     dump_cleanup,
     is_dump_enabled,
 )
-from ._io_common import next_exec_order
+from ._io_common import make_module_tag, make_op_tag, next_exec_order
 
 
 logger = logging.getLogger(__name__)
@@ -418,17 +418,23 @@ class OpManager:
         if not do_inspect and not do_dump:
             return fn(*args, **kwargs)
 
-        # Allocate a single exec_order shared by inspector and dumper
+        # Allocate a single exec_order, module_tag, and op_tag shared by
+        # inspector and dumper so that log lines and dump files correlate
+        # and shared counters are not double-incremented.
         order = next_exec_order()
+        module_tag = make_module_tag()
+        op_tag = make_op_tag(op_name)
 
         if do_inspect:
             try:
-                inspect_before(op_name, args, kwargs, exec_order=order)
+                inspect_before(op_name, args, kwargs, exec_order=order,
+                               module_tag=module_tag, op_tag=op_tag)
             except Exception as e:
                 logger.debug(f"inspect_before hook failed for '{op_name}': {e}")
         if do_dump:
             try:
-                dump_before(op_name, args, kwargs, exec_order=order)
+                dump_before(op_name, args, kwargs, exec_order=order,
+                            module_tag=module_tag, op_tag=op_tag)
             except Exception as e:
                 logger.debug(f"dump_before hook failed for '{op_name}': {e}")
 

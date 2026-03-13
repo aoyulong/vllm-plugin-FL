@@ -456,7 +456,7 @@ def tensor_stats(t: torch.Tensor) -> Dict[str, Any]:
         if float_only and not is_fp:
             continue
         try:
-            if float_only or is_fp:
+            if float_only:
                 if fp_tensor is None:
                     fp_tensor = t.detach().float()
                 meta[name] = fn(fp_tensor)
@@ -538,6 +538,58 @@ def make_op_tag(op_name: str) -> str:
     """Build ``[op=X,Y]``, incrementing the per-step op counter."""
     idx, count = next_op_counter(op_name)
     return f"[op={idx},{count}]"
+
+
+# ── Shared tag generation for stacked TorchFunctionMode handlers ──
+#
+# When both inspector and dumper TorchFunctionMode handlers are active,
+# they are stacked: the outer handler calls func() which enters the inner.
+# Without coordination, both would call make_op_tag() / next_exec_order(),
+# double-incrementing the shared counters.  These helpers ensure that tags
+# and exec_order are generated once (by the first handler) and reused by
+# the nested handler.
+
+_tf_tags = threading.local()
+
+
+def acquire_torch_func_tags(op_name: str) -> Tuple[str, str, int]:
+    """Get or generate (module_tag, op_tag, exec_order) for a torch function call.
+
+    The first caller (outermost TorchFunctionMode) generates and caches
+    the values.  Nested callers reuse the cached values, preventing
+    double-increment of shared counters.
+
+    Must be paired with :func:`release_torch_func_tags`.
+    """
+    depth = getattr(_tf_tags, "depth", 0)
+    _tf_tags.depth = depth + 1
+
+    if depth == 0:
+        # First (outermost) caller: generate and cache
+        module_tag = make_module_tag()
+        op_tag = make_op_tag(op_name)
+        order = next_exec_order()
+        _tf_tags.module_tag = module_tag
+        _tf_tags.op_tag = op_tag
+        _tf_tags.exec_order = order
+    else:
+        # Nested caller: reuse cached values
+        module_tag = getattr(_tf_tags, "module_tag", "")
+        op_tag = getattr(_tf_tags, "op_tag", "")
+        order = getattr(_tf_tags, "exec_order", 0)
+
+    return module_tag, op_tag, order
+
+
+def release_torch_func_tags() -> None:
+    """Release torch function tags.  Clears the cache when the outermost caller exits."""
+    depth = getattr(_tf_tags, "depth", 0)
+    if depth > 0:
+        _tf_tags.depth = depth - 1
+    if depth <= 1:
+        _tf_tags.module_tag = None
+        _tf_tags.op_tag = None
+        _tf_tags.exec_order = None
 
 
 def make_label(op_name: str, args: tuple = ()) -> str:

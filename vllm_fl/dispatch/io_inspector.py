@@ -77,6 +77,7 @@ from ._io_common import (
     HAS_TORCH_FUNC_MODE,
     TorchFunctionMode,
     acquire_global_module_hooks,
+    acquire_torch_func_tags,
     advance_step,
     expand_layer_specs,
     format_result,
@@ -103,6 +104,7 @@ from ._io_common import (
     record_seen,
     register_step_callback,
     release_global_module_hooks,
+    release_torch_func_tags,
     set_rank_filter,
     should_inspect_torch_func,
     unregister_step_callback,
@@ -260,7 +262,9 @@ def is_inspect_enabled() -> bool:
 
 
 def inspect_before(op_name: str, args: tuple, kwargs: dict,
-                   exec_order: Optional[int] = None) -> None:
+                   exec_order: Optional[int] = None,
+                   module_tag: Optional[str] = None,
+                   op_tag: Optional[str] = None) -> None:
     """Capture operator inputs before execution (called from OpManager).
 
     Inputs are stored in thread-local and combined with outputs in
@@ -271,6 +275,10 @@ def inspect_before(op_name: str, args: tuple, kwargs: dict,
             ``_call_with_hooks`` a single order is shared with the dumper so
             that log lines and dump files can be correlated.  If *None*, an
             order is allocated internally (standalone usage).
+        module_tag: Pre-computed module counter tag (e.g. ``[module=0,1]``).
+            When *None*, generated internally.
+        op_tag: Pre-computed op counter tag (e.g. ``[op=3,2]``).
+            When *None*, generated internally.
     """
     if guard_active():
         return
@@ -280,8 +288,8 @@ def inspect_before(op_name: str, args: tuple, kwargs: dict,
         return
     order = exec_order if exec_order is not None else next_exec_order()
     label = make_label(f"Op '{op_name}'", args)
-    module_tag = make_module_tag()
-    op_tag = make_op_tag(op_name)
+    _module_tag = module_tag if module_tag is not None else make_module_tag()
+    _op_tag = op_tag if op_tag is not None else make_op_tag(op_name)
     record_seen(op_name, args)
     set_guard(True)
     try:
@@ -293,7 +301,7 @@ def inspect_before(op_name: str, args: tuple, kwargs: dict,
     if stack is None:
         _inspect_pairing.stack = {}
         stack = _inspect_pairing.stack
-    stack.setdefault(op_name, []).append((label, order, input_lines, module_tag, op_tag))
+    stack.setdefault(op_name, []).append((label, order, input_lines, _module_tag, _op_tag))
 
 
 def inspect_after(op_name: str, args: tuple, result: Any,
@@ -488,17 +496,18 @@ if HAS_TORCH_FUNC_MODE:
             # Include enclosing module context in label
             full_name = f"torch.{func_name}"
             label = make_label(full_name)
-            module_tag = make_module_tag()
-            op_tag = make_op_tag(full_name)
+            module_tag, op_tag, order = acquire_torch_func_tags(full_name)
             record_seen(full_name)
-            order = next_exec_order()
             set_guard(True)
             try:
                 input_lines = _format_inputs(args, kwargs)
             finally:
                 set_guard(False)
 
-            result = func(*args, **kwargs)
+            try:
+                result = func(*args, **kwargs)
+            finally:
+                release_torch_func_tags()
 
             set_guard(True)
             try:
