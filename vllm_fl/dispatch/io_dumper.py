@@ -699,10 +699,9 @@ def _set_env_vars(
     else:
         os.environ.pop("VLLM_FL_IO_DUMP_STEP_RANGE", None)
 
-    if torch_funcs:
-        os.environ["VLLM_FL_IO_DUMP_TORCH_FUNCS"] = "1"
-    else:
-        os.environ.pop("VLLM_FL_IO_DUMP_TORCH_FUNCS", None)
+    # Always set explicitly so child processes don't fall back to
+    # the match-all default when torch_funcs was disabled.
+    os.environ["VLLM_FL_IO_DUMP_TORCH_FUNCS"] = "1" if torch_funcs else "0"
 
     if ranks is not None:
         os.environ["VLLM_FL_IO_DUMP_RANK"] = ",".join(str(r) for r in sorted(ranks))

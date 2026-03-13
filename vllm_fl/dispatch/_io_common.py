@@ -1066,7 +1066,10 @@ def _parse_inspect_section(cfg: Dict[str, Any]) -> Dict[str, Any]:
     parsed["layers"] = expand_layer_specs(_parse_string_list(cfg.get("layers")))
     parsed["step_range"] = _parse_step_range_yaml(cfg)
 
-    parsed["torch_funcs"] = _parse_torch_funcs_yaml(cfg.get("torch_funcs"))
+    # Only include torch_funcs when explicitly set in YAML so that
+    # _init_from_env can apply the match-all default for absent keys.
+    if "torch_funcs" in cfg:
+        parsed["torch_funcs"] = _parse_torch_funcs_yaml(cfg["torch_funcs"])
     parsed["ranks"] = _parse_ranks_yaml(cfg.get("ranks"))
 
     return parsed
@@ -1091,7 +1094,10 @@ def _parse_dump_section(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     parsed["step_range"] = _parse_step_range_yaml(cfg)
 
-    parsed["torch_funcs"] = _parse_torch_funcs_yaml(cfg.get("torch_funcs"))
+    # Only include torch_funcs when explicitly set in YAML so that
+    # _init_from_env can apply the match-all default for absent keys.
+    if "torch_funcs" in cfg:
+        parsed["torch_funcs"] = _parse_torch_funcs_yaml(cfg["torch_funcs"])
     parsed["ranks"] = _parse_ranks_yaml(cfg.get("ranks"))
     parsed["meta_only"] = bool(cfg.get("meta_only", True))
 

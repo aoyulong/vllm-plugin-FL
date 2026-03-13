@@ -233,14 +233,15 @@ def _format_inputs(args: tuple, kwargs: dict,
 
 def _log_combined(label: str, input_lines: List[str], result: Any,
                   module_tag: str = "",
-                  op_tag: str = "") -> None:
+                  op_tag: str = "",
+                  exec_order: int = 0) -> None:
     """Log a consolidated INPUTS + OUTPUTS block for an op call."""
     rank = get_rank()
     step = get_step()
     sep = "-" * 60
     parts = [
         f"\n{sep}",
-        f"[IO_INSPECT][rank={rank}][step={step}]{module_tag}{op_tag} {label}",
+        f"[IO_INSPECT][rank={rank}][step={step}][exec_order={exec_order}]{module_tag}{op_tag} {label}",
         f"{sep}",
         "  INPUTS:",
     ]
@@ -253,11 +254,12 @@ def _log_combined(label: str, input_lines: List[str], result: Any,
 
 def _log_outputs_only(label: str, result: Any,
                       module_tag: str = "",
-                      op_tag: str = "") -> None:
+                      op_tag: str = "",
+                      exec_order: int = 0) -> None:
     """Log operator/module outputs only (fallback when no pairing)."""
     rank = get_rank()
     step = get_step()
-    logger.info(f"[IO_INSPECT][rank={rank}][step={step}]{module_tag}{op_tag} {label} OUTPUTS:\n{format_result(result)}")
+    logger.info(f"[IO_INSPECT][rank={rank}][step={step}][exec_order={exec_order}]{module_tag}{op_tag} {label} OUTPUTS:\n{format_result(result)}")
 
 
 # ── Public API ──
@@ -335,7 +337,8 @@ def inspect_after(op_name: str, args: tuple, result: Any) -> None:
         if pairing:
             label, order, input_lines, module_tag, op_tag = pairing
             _log_combined(label, input_lines, result,
-                          module_tag=module_tag, op_tag=op_tag)
+                          module_tag=module_tag, op_tag=op_tag,
+                          exec_order=order)
         else:
             # Fallback: no pairing (shouldn't happen normally)
             module_tag = make_module_tag()
@@ -468,10 +471,9 @@ def _set_env_vars(
             tokens.extend(f"module:{m}" for m in sorted(modules))
         os.environ["VLLM_FL_IO_INSPECT"] = ",".join(tokens) if tokens else "1"
 
-    if torch_funcs:
-        os.environ["VLLM_FL_IO_INSPECT_TORCH_FUNCS"] = "1"
-    else:
-        os.environ.pop("VLLM_FL_IO_INSPECT_TORCH_FUNCS", None)
+    # Always set explicitly so child processes don't fall back to
+    # the match-all default when torch_funcs was disabled.
+    os.environ["VLLM_FL_IO_INSPECT_TORCH_FUNCS"] = "1" if torch_funcs else "0"
 
     if ranks is not None:
         os.environ["VLLM_FL_IO_INSPECT_RANK"] = ",".join(str(r) for r in sorted(ranks))
@@ -531,7 +533,8 @@ if HAS_TORCH_FUNC_MODE:
             set_guard(True)
             try:
                 _log_combined(label, input_lines, result,
-                              module_tag=module_tag, op_tag=op_tag)
+                              module_tag=module_tag, op_tag=op_tag,
+                              exec_order=order)
             finally:
                 set_guard(False)
 
