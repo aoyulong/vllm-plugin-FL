@@ -18,6 +18,7 @@ from .types import OpImpl, BackendImplKind, match_token
 from .io_inspector import (
     inspect_before,
     inspect_after,
+    inspect_cleanup,
     is_inspect_enabled,
 )
 from .io_dumper import (
@@ -441,7 +442,12 @@ class OpManager:
         try:
             result = fn(*args, **kwargs)
         except Exception:
-            # Clean up stale dump pairing so the stack stays consistent
+            # Clean up stale pairings so the stacks stay consistent
+            if do_inspect:
+                try:
+                    inspect_cleanup(op_name)
+                except Exception:
+                    pass
             if do_dump:
                 try:
                     dump_cleanup(op_name)
@@ -451,7 +457,7 @@ class OpManager:
 
         if do_inspect:
             try:
-                inspect_after(op_name, args, result, exec_order=order)
+                inspect_after(op_name, args, result)
             except Exception as e:
                 logger.debug(f"inspect_after hook failed for '{op_name}': {e}")
         if do_dump:

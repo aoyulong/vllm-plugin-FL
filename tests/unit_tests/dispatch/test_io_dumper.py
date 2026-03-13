@@ -28,12 +28,10 @@ from vllm_fl.dispatch._io_common import (
     parse_torch_funcs_config,
     pop_module_context,
     push_module_context,
-    rank_enabled,
     register_module_paths,
     reset_exec_order,
     reset_rank,
     reset_step,
-    set_rank_filter,
 )
 from vllm_fl.dispatch.io_dumper import (
     _build_data,
@@ -200,14 +198,14 @@ class TestShouldDump:
     def test_step_range(self, dump_dir):
         from vllm_fl.dispatch import _io_common
 
-        enable_io_dump(dump_dir, step_range=(5, 10))
+        enable_io_dump(dump_dir, step_range="5-10")
         _io_common._step_counter = 3
         assert not _should_dump("test_op", ())
         _io_common._step_counter = 5
         assert _should_dump("test_op", ())
-        _io_common._step_counter = 9
-        assert _should_dump("test_op", ())
         _io_common._step_counter = 10
+        assert _should_dump("test_op", ())
+        _io_common._step_counter = 11
         assert not _should_dump("test_op", ())
 
 
@@ -364,13 +362,13 @@ class TestProgrammaticAPI:
             ops={"rms_norm"},
             modules={"Linear"},
             max_calls=10,
-            step_range=(0, 100),
+            step_range="0-100",
         )
         assert is_dump_enabled()
         assert io_dumper._op_filter == {"rms_norm"}
         assert io_dumper._module_filter == {"Linear"}
         assert io_dumper._max_calls == 10
-        assert io_dumper._step_range == (0, 100)
+        assert io_dumper._step_range == (0, 101)
 
     def test_disable_resets_everything(self, dump_dir):
         enable_io_dump(dump_dir, ops={"rms_norm"}, max_calls=5)
@@ -878,7 +876,7 @@ io_dump:
   modules:
     - Linear
   max_calls: 50
-  step_range: [2, 10]
+  step_range: "2-10"
   torch_funcs: true
 """
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
@@ -892,7 +890,7 @@ io_dump:
             assert dump_cfg["ops"] == {"rms_norm", "silu_and_mul"}
             assert dump_cfg["modules"] == {"Linear"}
             assert dump_cfg["max_calls"] == 50
-            assert dump_cfg["step_range"] == (2, 10)
+            assert dump_cfg["step_range"] == (2, 11)
             tf_enabled, tf_filter = dump_cfg["torch_funcs"]
             assert tf_enabled is True
             assert tf_filter == set()
@@ -1030,13 +1028,13 @@ class TestRankInDumper:
         disable_io_dump()
         reset_exec_order()
         reset_rank()
-        set_rank_filter(None)
+        io_dumper._rank_filter = None
 
     def teardown_method(self):
         disable_io_dump()
         reset_exec_order()
         reset_rank()
-        set_rank_filter(None)
+        io_dumper._rank_filter = None
         os.environ.pop("RANK", None)
 
     def test_dump_creates_rank_directory(self, dump_dir):
@@ -1098,13 +1096,13 @@ class TestRankFilterInDumper:
         disable_io_dump()
         reset_exec_order()
         reset_rank()
-        set_rank_filter(None)
+        io_dumper._rank_filter = None
 
     def teardown_method(self):
         disable_io_dump()
         reset_exec_order()
         reset_rank()
-        set_rank_filter(None)
+        io_dumper._rank_filter = None
         os.environ.pop("RANK", None)
 
     def test_rank_filter_blocks_dump(self, dump_dir):
@@ -1136,7 +1134,7 @@ class TestRankFilterInDumper:
         reset_rank()
         io_dumper._init_from_env()
         assert is_dump_enabled()
-        assert rank_enabled()
+        assert io_dumper._rank_ok()
 
     @patch.dict(
         os.environ,
@@ -1147,7 +1145,7 @@ class TestRankFilterInDumper:
         reset_rank()
         io_dumper._init_from_env()
         assert is_dump_enabled()
-        assert not rank_enabled()
+        assert not io_dumper._rank_ok()
 
 
 class TestYamlRanksConfigDumper:
@@ -1156,12 +1154,12 @@ class TestYamlRanksConfigDumper:
     def setup_method(self):
         disable_io_dump()
         reset_rank()
-        set_rank_filter(None)
+        io_dumper._rank_filter = None
 
     def teardown_method(self):
         disable_io_dump()
         reset_rank()
-        set_rank_filter(None)
+        io_dumper._rank_filter = None
 
     def test_yaml_dump_ranks_list(self):
         cfg_content = """
@@ -1196,10 +1194,10 @@ io_dump:
             with patch.dict(os.environ, {"VLLM_FL_CONFIG": cfg_path}, clear=False):
                 io_dumper._init_from_env()
             assert is_dump_enabled()
-            assert rank_enabled()
+            assert io_dumper._rank_ok()
         finally:
             os.unlink(cfg_path)
-            set_rank_filter(None)
+            io_dumper._rank_filter = None
 
 
 class TestStepSummary:

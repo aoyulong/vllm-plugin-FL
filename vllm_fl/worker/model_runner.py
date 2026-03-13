@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import functools
 import gc
 import itertools
@@ -3725,15 +3726,23 @@ class ModelRunnerFL(
             time_after_load - time_before_load,
             scope="local",
         )
-        # Register module paths for IO layer filtering and initialize
-        # IO inspector/dumper from env vars (if set) so hooks are active
-        # before the first forward pass.  Importing the modules triggers
-        # _init_from_env() which reads VLLM_FL_IO_INSPECT / VLLM_FL_IO_DUMP
-        # env vars and activates hooks.
+        # Always register module paths — cheap (one pass over named_modules)
+        # and required by all three IO configuration methods (env vars, YAML,
+        # and the Python API) for layer-path filtering to work.
         from vllm_fl.dispatch._io_common import register_module_paths
-        import vllm_fl.dispatch.io_inspector  # noqa: F401
-        import vllm_fl.dispatch.io_dumper  # noqa: F401
         register_module_paths(self.model)
+        # Import io_inspector/io_dumper to trigger _init_from_env() only when
+        # configured via env vars or YAML config.  Python API users import
+        # these modules themselves when calling enable_io_inspect/enable_io_dump.
+        _io_env_prefixes = ("VLLM_FL_IO_INSPECT", "VLLM_FL_IO_DUMP",
+                            "VLLM_FL_IO_STEP_RANGE", "VLLM_FL_IO_LAYERS",
+                            "VLLM_FL_IO_RANK")
+        _io_requested = any(
+            k.startswith(_io_env_prefixes) for k in os.environ
+        ) or os.environ.get("VLLM_FL_CONFIG", "").strip()
+        if _io_requested:
+            import vllm_fl.dispatch.io_inspector  # noqa: F401
+            import vllm_fl.dispatch.io_dumper  # noqa: F401
         prepare_communication_buffer_for_model(self.model)
         if (drafter := getattr(self, "drafter", None)) and (
             drafter_model := getattr(drafter, "model", None)

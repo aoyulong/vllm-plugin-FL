@@ -84,27 +84,7 @@ def reset_rank() -> None:
     _rank = None
 
 
-# ── Rank filter ──
-
-_rank_filter: Optional[Set[int]] = None  # None = all ranks
-
-
-def set_rank_filter(ranks: Optional[Set[int]]) -> None:
-    """Set which ranks should run IO hooks. None = all ranks."""
-    global _rank_filter
-    _rank_filter = ranks
-
-
-def get_rank_filter() -> Optional[Set[int]]:
-    """Get current rank filter. None means all ranks are enabled."""
-    return _rank_filter
-
-
-def rank_enabled() -> bool:
-    """Check if the current rank should run IO hooks."""
-    if _rank_filter is None:
-        return True
-    return get_rank() in _rank_filter
+# ── Rank filter parsing ──
 
 
 def parse_rank_filter(value: str) -> Optional[Set[int]]:
@@ -414,6 +394,7 @@ _TENSOR_STAT_REGISTRY: List[Tuple[str, Callable[[torch.Tensor], Any], bool]] = [
     ("mean", _stat_mean, True),
     ("std", _stat_std, True),
 ]
+_tensor_stat_lock = threading.Lock()
 
 
 def register_tensor_stat(
@@ -427,6 +408,9 @@ def register_tensor_stat(
     For ``float_only=True`` (default), the tensor is ``t.detach().float()``;
     for ``float_only=False``, the original tensor is passed.
 
+    If a stat with the same *name* already exists, it is replaced.
+    Raises ``ValueError`` if *name* is empty.
+
     Example::
 
         from vllm_fl.dispatch import register_tensor_stat
@@ -434,7 +418,14 @@ def register_tensor_stat(
         register_tensor_stat("sparsity",
                              lambda t: (t == 0).float().mean().item())
     """
-    _TENSOR_STAT_REGISTRY.append((name, fn, float_only))
+    if not name or not name.strip():
+        raise ValueError("Tensor stat name must be a non-empty string")
+    with _tensor_stat_lock:
+        for i, (existing_name, _, _) in enumerate(_TENSOR_STAT_REGISTRY):
+            if existing_name == name:
+                _TENSOR_STAT_REGISTRY[i] = (name, fn, float_only)
+                return
+        _TENSOR_STAT_REGISTRY.append((name, fn, float_only))
 
 
 def tensor_stats(t: torch.Tensor) -> Dict[str, Any]:
@@ -664,6 +655,60 @@ def release_global_module_hooks() -> None:
             _global_hook_handles.clear()
 
 
+# ── Per-Model Hook Helpers ──
+#
+# Shared by inspector and dumper.  These attach module context hooks
+# (push/pop) to specific named submodules, unlike the global hooks
+# above which intercept every module.  Each caller keeps its own
+# handle list so that inspector and dumper hooks can be removed
+# independently.
+
+
+def attach_per_model_hooks(
+    model: torch.nn.Module,
+    *,
+    enabled: bool,
+    match_all: bool,
+    op_filter: Set[str],
+    module_filter: Set[str],
+) -> List[Any]:
+    """Attach module context hooks to submodules matching the filter.
+
+    Returns a list of hook handles.  The caller should store these
+    in its own ``_hook_handles`` list and use :func:`remove_per_model_hooks`
+    to remove them later.
+    """
+    if not enabled:
+        return []
+    handles: List[Any] = []
+    for name, mod in model.named_modules():
+        if not match_all:
+            cls_name = type(mod).__name__
+            if cls_name not in module_filter and name not in op_filter:
+                continue
+        h1 = mod.register_forward_pre_hook(_per_model_pre_hook)
+        h2 = mod.register_forward_hook(_per_model_post_hook)
+        handles.extend([h1, h2])
+    return handles
+
+
+def remove_per_model_hooks(handles: List[Any]) -> None:
+    """Remove per-model hooks and clear the handle list."""
+    for h in handles:
+        h.remove()
+    handles.clear()
+
+
+def _per_model_pre_hook(module, args):
+    """Push module onto the context stack (per-model hook)."""
+    push_module_context(type(module).__name__, module)
+
+
+def _per_model_post_hook(module, args, output):
+    """Pop module from the context stack (per-model hook)."""
+    pop_module_context()
+
+
 # ── Common parsing ──
 
 
@@ -695,15 +740,37 @@ def parse_step_range_env(*env_vars: str) -> Optional[Tuple[int, int]]:
         value = os.environ.get(var, "").strip()
         if not value:
             continue
-        if "-" in value:
-            parts = value.split("-", 1)
-            try:
-                return (int(parts[0].strip()), int(parts[1].strip()) + 1)
-            except ValueError:
-                pass
-        elif value.isdigit():
-            s = int(value)
-            return (s, s + 1)
+        result = parse_step_range(value)
+        if result is not None:
+            return result
+    return None
+
+
+def parse_step_range(value) -> Optional[Tuple[int, int]]:
+    """Parse a step range string into a half-open tuple for internal use.
+
+    Accepted formats (all inclusive):
+    - ``"start-end"``: ``"0-2"`` → ``(0, 3)`` (steps 0, 1, 2)
+    - Bare integer: ``"5"`` → ``(5, 6)`` (step 5 only)
+
+    Returns ``None`` if the value is ``None``, empty, or cannot be parsed.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if "-" in value:
+        parts = value.split("-", 1)
+        try:
+            return (int(parts[0].strip()), int(parts[1].strip()) + 1)
+        except ValueError:
+            return None
+    elif value.isdigit():
+        s = int(value)
+        return (s, s + 1)
     return None
 
 
@@ -927,7 +994,7 @@ def parse_io_config_from_yaml(config_path: str) -> Dict[str, Any]:
           modules:
             - Linear
           max_calls: 100
-          step_range: [5, 15]     # half-open [start, end)
+          step_range: "5-15"      # inclusive "start-end"
           torch_funcs: true
 
     Returns:
@@ -959,14 +1026,25 @@ def parse_io_config_from_yaml(config_path: str) -> Dict[str, Any]:
 
 
 def _parse_step_range_yaml(cfg: Dict[str, Any]) -> Optional[Tuple[int, int]]:
-    """Parse ``step_range: [start, end]`` (half-open) from a YAML section."""
+    """Parse ``step_range`` from a YAML section.
+
+    Accepts a dash-string like ``"0-2"`` (inclusive, same format as env vars).
+    Returns a half-open ``(start, end+1)`` tuple for internal use,
+    or ``None`` if unset / invalid.
+    """
     step_range = cfg.get("step_range")
-    if isinstance(step_range, (list, tuple)) and len(step_range) == 2:
-        try:
-            return (int(step_range[0]), int(step_range[1]))
-        except (ValueError, TypeError):
-            pass
-    return None
+    if step_range is None:
+        return None
+    # Convert int/list to string for uniform handling
+    if isinstance(step_range, int):
+        step_range = str(step_range)
+    elif isinstance(step_range, (list, tuple)):
+        # Legacy [start, end] format — convert to "start-end" string
+        if len(step_range) == 2:
+            step_range = f"{step_range[0]}-{step_range[1]}"
+        else:
+            return None
+    return parse_step_range(step_range)
 
 
 def _parse_inspect_section(cfg: Dict[str, Any]) -> Dict[str, Any]:

@@ -26,7 +26,7 @@ Configuration (priority order):
           modules: [Linear]
           layers: [0, 1-3, model.layers.*.self_attn]
           max_calls: 100
-          step_range: [5, 15]     # half-open [start, end)
+          step_range: "5-15"      # inclusive "start-end"
           torch_funcs: true
           meta_only: true          # default; set false to dump .pt tensors
     3. Environment variables:
@@ -86,6 +86,7 @@ from ._io_common import (
     acquire_global_module_hooks,
     acquire_torch_func_tags,
     advance_step,
+    attach_per_model_hooks,
     expand_layer_specs,
     get_module_class_name,
     get_rank,
@@ -101,16 +102,14 @@ from ._io_common import (
     parse_io_config_from_yaml,
     parse_layers_env,
     parse_rank_filter,
+    parse_step_range,
     parse_step_range_env,
     parse_torch_funcs_config,
-    pop_module_context,
-    push_module_context,
-    rank_enabled,
     record_seen,
     register_step_callback,
     release_global_module_hooks,
     release_torch_func_tags,
-    set_rank_filter,
+    remove_per_model_hooks,
     should_inspect_torch_func,
     tensor_stats,
     unregister_step_callback,
@@ -147,6 +146,15 @@ _dump_pairing = threading.local()
 
 _torch_funcs_enabled: bool = False
 _torch_func_filter: Set[str] = set()
+_rank_filter: Optional[Set[int]] = None  # None = all ranks
+
+
+def _rank_ok() -> bool:
+    """Check if the current rank passes this subsystem's rank filter."""
+    if _rank_filter is None:
+        return True
+    return get_rank() in _rank_filter
+
 
 # Hook handles
 _hook_handles: List[Any] = []
@@ -361,16 +369,27 @@ def _append_to_json(json_path: str, key: str, value: dict) -> None:
     """Add a key to a JSON file (read-modify-write). Creates file if needed.
 
     Uses a per-file lock to prevent concurrent updates from corrupting the file.
+    If the existing file is corrupted or unreadable, it is treated as empty so
+    that subsequent dumps are not permanently broken.
     """
     lock = _get_json_lock(json_path)
     with lock:
         data: Dict[str, Any] = {}
         if os.path.exists(json_path):
-            with open(json_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning(
+                    f"Corrupt or unreadable JSON '{json_path}': {exc}. "
+                    "Starting fresh."
+                )
+                data = {}
         data[key] = value
-        with open(json_path, "w", encoding="utf-8") as f:
+        tmp_path = json_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+        os.replace(tmp_path, json_path)
 
 
 # ── Dump helpers ──
@@ -483,7 +502,7 @@ def dump_before(op_name: str, args: tuple, kwargs: dict,
     """
     if guard_active():
         return
-    if not rank_enabled():
+    if not _rank_ok():
         return
     if not _should_dump(op_name, args):
         return
@@ -503,7 +522,7 @@ def dump_after(op_name: str, args: tuple, result: Any) -> None:
     """Dump operator outputs (called from OpManager)."""
     if guard_active():
         return
-    if not rank_enabled():
+    if not _rank_ok():
         return
     if not _should_dump(op_name, args):
         return
@@ -540,7 +559,7 @@ def enable_io_dump(
     modules: Optional[Set[str]] = None,
     layers: Optional[Set[str]] = None,
     max_calls: int = 0,
-    step_range: Optional[Tuple[int, int]] = None,
+    step_range: Optional[str] = None,
     torch_funcs: bool = True,
     ranks: Optional[Set[int]] = None,
     meta_only: bool = True,
@@ -563,7 +582,9 @@ def enable_io_dump(
             ranges (``"0-3"``), glob patterns (``"model.layers.*.self_attn"``),
             and full paths.  None = no layer scoping.
         max_calls: Max calls per op to dump (0 = unlimited).
-        step_range: (start, end) half-open range for step filtering.
+        step_range: Inclusive step range string.  ``"0-2"`` means
+            steps 0, 1, 2.  A bare integer ``"5"`` means step 5 only.
+            None = all steps.
         torch_funcs: Intercept bare torch functional ops. Default True
             (all intercepted). Set False to skip torch functions.
         ranks: Set of ranks to dump on. None = all ranks.
@@ -573,6 +594,7 @@ def enable_io_dump(
     """
     global _enabled, _dump_dir, _match_all, _op_filter, _module_filter, _layer_filter
     global _max_calls, _step_range, _torch_funcs_enabled, _torch_func_filter, _meta_only
+    global _rank_filter
 
     _dump_dir = dump_dir if dump_dir else os.path.join(os.getcwd(), "io_dump")
     os.makedirs(_dump_dir, exist_ok=True)
@@ -596,23 +618,25 @@ def enable_io_dump(
     _layer_filter = set(layers) if layers else set()
 
     _max_calls = max_calls
-    # If no step_range given explicitly, check env vars
-    if step_range is None:
-        step_range = parse_step_range_env(
+    # Parse step_range: accepts string "0-2" or None.
+    # parse_step_range handles inclusive→half-open conversion.
+    if step_range is not None:
+        _step_range = parse_step_range(step_range)
+    else:
+        _step_range = parse_step_range_env(
             "VLLM_FL_IO_DUMP_STEP_RANGE", "VLLM_FL_IO_STEP_RANGE"
         )
-    _step_range = step_range
     _torch_funcs_enabled = torch_funcs
     _torch_func_filter = set()
     _meta_only = meta_only
     _enabled = True
 
-    set_rank_filter(ranks)
+    _rank_filter = ranks
     _activate_hooks()
 
     # Propagate to env vars so child processes (e.g. vLLM EngineCore workers)
     # pick up the config via _init_from_env() on module import.
-    _set_env_vars(_dump_dir, ops, modules, _layer_filter, max_calls, step_range,
+    _set_env_vars(_dump_dir, ops, modules, _layer_filter, max_calls, _step_range,
                   torch_funcs, ranks, _meta_only)
 
     logger.info(
@@ -709,7 +733,7 @@ if HAS_TORCH_FUNC_MODE:
     class _DumpTorchFuncMode(TorchFunctionMode):
         def __torch_function__(self, func, types, args=(), kwargs=None):
             kwargs = kwargs or {}
-            if torch.compiler.is_compiling() or not _enabled or guard_active() or not rank_enabled():
+            if torch.compiler.is_compiling() or not _enabled or guard_active() or not _rank_ok():
                 return func(*args, **kwargs)
 
             func_name = get_torch_func_name(func)
@@ -790,54 +814,24 @@ def _deactivate_hooks():
         _torch_func_mode_instance = None
 
 
-# ── Per-Model Hook Support (backward compatible) ──
-#
-# These hooks push/pop module context for specific named submodules,
-# mirroring the global hooks but on a per-model basis.
-
-
-def _should_hook_module(module: torch.nn.Module, name: str) -> bool:
-    """Check if a specific module instance should have hooks attached."""
-    if _match_all:
-        return True
-    cls_name = type(module).__name__
-    if cls_name in _module_filter:
-        return True
-    if name in _op_filter:
-        return True
-    return False
-
-
-def _make_dump_pre_hook():
-    def hook(module, args):
-        cls_name = type(module).__name__
-        push_module_context(cls_name, module)
-    return hook
-
-
-def _make_dump_post_hook():
-    def hook(module, args, output):
-        pop_module_context()
-    return hook
+# ── Per-Model Hook Support ──
 
 
 def attach_dump_hooks(model: torch.nn.Module) -> int:
-    """
-    Attach IO dump hooks to specific submodules of a model.
+    """Attach IO dump hooks to specific submodules of a model.
 
     When using enable_io_dump() with a modules filter, global hooks
     are registered automatically. Use this for targeted per-model hooks.
     """
-    if not _enabled:
-        return 0
-    count = 0
-    for name, module in model.named_modules():
-        if not _should_hook_module(module, name):
-            continue
-        h1 = module.register_forward_pre_hook(_make_dump_pre_hook())
-        h2 = module.register_forward_hook(_make_dump_post_hook())
-        _hook_handles.extend([h1, h2])
-        count += 1
+    handles = attach_per_model_hooks(
+        model,
+        enabled=_enabled,
+        match_all=_match_all,
+        op_filter=_op_filter,
+        module_filter=_module_filter,
+    )
+    count = len(handles) // 2
+    _hook_handles.extend(handles)
     if count > 0:
         logger.info(f"[IO_DUMP] Attached dump hooks to {count} modules")
     return count
@@ -845,9 +839,7 @@ def attach_dump_hooks(model: torch.nn.Module) -> int:
 
 def remove_dump_hooks() -> None:
     """Remove all per-model IO dump hooks."""
-    for h in _hook_handles:
-        h.remove()
-    _hook_handles.clear()
+    remove_per_model_hooks(_hook_handles)
 
 
 # ── Environment Initialization ──
@@ -857,7 +849,7 @@ def _reset_state() -> None:
     """Reset all module-level state to defaults."""
     global _enabled, _dump_dir, _match_all, _op_filter, _module_filter, _layer_filter
     global _max_calls, _step_range, _meta_only
-    global _torch_funcs_enabled, _torch_func_filter
+    global _torch_funcs_enabled, _torch_func_filter, _rank_filter
 
     _enabled = False
     _dump_dir = ""
@@ -870,6 +862,7 @@ def _reset_state() -> None:
     _meta_only = True
     _torch_funcs_enabled = False
     _torch_func_filter = set()
+    _rank_filter = None
     with _lock:
         _call_counters.clear()
 
@@ -878,6 +871,7 @@ def _init_from_env() -> None:
     """Initialize from VLLM_FL_IO_DUMP* environment variables or YAML config."""
     global _enabled, _dump_dir, _match_all, _op_filter, _module_filter, _layer_filter
     global _max_calls, _step_range, _torch_funcs_enabled, _torch_func_filter, _meta_only
+    global _rank_filter
 
     _deactivate_hooks()
 
@@ -891,7 +885,15 @@ def _init_from_env() -> None:
                 _reset_state()
                 return
             _dump_dir = io_cfg["dir"] if io_cfg.get("dir") else os.path.join(os.getcwd(), "io_dump")
-            os.makedirs(_dump_dir, exist_ok=True)
+            try:
+                os.makedirs(_dump_dir, exist_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    f"Cannot create dump directory '{_dump_dir}': {exc}. "
+                    "IO dumping disabled."
+                )
+                _reset_state()
+                return
 
             ops = io_cfg.get("ops", set())
             modules = io_cfg.get("modules", set())
@@ -916,12 +918,12 @@ def _init_from_env() -> None:
 
             _enabled = True
 
-            set_rank_filter(io_cfg.get("ranks"))
+            _rank_filter = io_cfg.get("ranks")
             _activate_hooks()
 
             logger.info(
                 f"IO Dump enabled (YAML): rank={get_rank()}, "
-                f"rank_filter={io_cfg.get('ranks') or 'all'}, dir={_dump_dir}, "
+                f"rank_filter={_rank_filter or 'all'}, dir={_dump_dir}, "
                 f"ops={_op_filter or 'all'}, modules={_module_filter or 'all'}, "
                 f"layers={_layer_filter or 'all'}, "
                 f"max_calls={_max_calls}, step_range={_step_range}, "
@@ -955,7 +957,15 @@ def _init_from_env() -> None:
         dump_dir = os.path.join(os.getcwd(), "io_dump")
 
     _dump_dir = dump_dir
-    os.makedirs(_dump_dir, exist_ok=True)
+    try:
+        os.makedirs(_dump_dir, exist_ok=True)
+    except OSError as exc:
+        logger.warning(
+            f"Cannot create dump directory '{_dump_dir}': {exc}. "
+            "IO dumping disabled."
+        )
+        _reset_state()
+        return
 
     ops_str = os.environ.get("VLLM_FL_IO_DUMP_OPS", "").strip()
     modules_str = os.environ.get("VLLM_FL_IO_DUMP_MODULES", "").strip()
@@ -1001,13 +1011,13 @@ def _init_from_env() -> None:
     # Parse rank filter (dumper-specific → shared fallback)
     rank_env = os.environ.get("VLLM_FL_IO_DUMP_RANK", "") or os.environ.get("VLLM_FL_IO_RANK", "")
     if rank_env:
-        set_rank_filter(parse_rank_filter(rank_env))
+        _rank_filter = parse_rank_filter(rank_env)
 
     _activate_hooks()
 
     logger.info(
         f"IO Dump enabled: rank={get_rank()}, "
-        f"rank_filter={parse_rank_filter(rank_env) if rank_env else 'all'}, "
+        f"rank_filter={_rank_filter or 'all'}, "
         f"dir={_dump_dir}, "
         f"ops={_op_filter or 'all'}, modules={_module_filter or 'all'}, "
         f"layers={_layer_filter or 'all'}, "

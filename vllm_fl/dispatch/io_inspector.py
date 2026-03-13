@@ -27,7 +27,7 @@ Configuration (priority order):
           modules: [RMSNormFL, Qwen3Attention]
           layers: [0, 1-3, model.layers.*.self_attn]
           torch_funcs: true
-          step_range: [5, 15]     # half-open [start, end)
+          step_range: "5-15"      # inclusive "start-end"
     3. Environment variables:
         VLLM_FL_IO_INSPECT:
             "1"                     - Inspect all operators
@@ -78,7 +78,7 @@ from ._io_common import (
     TorchFunctionMode,
     acquire_global_module_hooks,
     acquire_torch_func_tags,
-    advance_step,
+    attach_per_model_hooks,
     expand_layer_specs,
     format_result,
     format_value,
@@ -96,16 +96,14 @@ from ._io_common import (
     parse_io_config_from_yaml,
     parse_layers_env,
     parse_rank_filter,
+    parse_step_range,
     parse_step_range_env,
     parse_torch_funcs_config,
-    pop_module_context,
-    push_module_context,
-    rank_enabled,
     record_seen,
     register_step_callback,
     release_global_module_hooks,
     release_torch_func_tags,
-    set_rank_filter,
+    remove_per_model_hooks,
     should_inspect_torch_func,
     unregister_step_callback,
 )
@@ -126,6 +124,15 @@ _layer_filter: Set[str] = set()
 _step_range: Optional[Tuple[int, int]] = None
 _torch_funcs_enabled: bool = False
 _torch_func_filter: Set[str] = set()
+_rank_filter: Optional[Set[int]] = None  # None = all ranks
+
+
+def _rank_ok() -> bool:
+    """Check if the current rank passes this subsystem's rank filter."""
+    if _rank_filter is None:
+        return True
+    return get_rank() in _rank_filter
+
 
 # Hook handles
 _hook_handles: List[Any] = []          # Per-model hooks (attach_io_hooks)
@@ -282,7 +289,7 @@ def inspect_before(op_name: str, args: tuple, kwargs: dict,
     """
     if guard_active():
         return
-    if not rank_enabled():
+    if not _rank_ok():
         return
     if not _should_inspect(op_name, args):
         return
@@ -304,19 +311,15 @@ def inspect_before(op_name: str, args: tuple, kwargs: dict,
     stack.setdefault(op_name, []).append((label, order, input_lines, _module_tag, _op_tag))
 
 
-def inspect_after(op_name: str, args: tuple, result: Any,
-                  exec_order: Optional[int] = None) -> None:
+def inspect_after(op_name: str, args: tuple, result: Any) -> None:
     """Log consolidated INPUTS+OUTPUTS block (called from OpManager).
 
     Retrieves inputs captured by ``inspect_before`` and combines them
     with the result into a single log message.
-
-    Args:
-        exec_order: Pre-allocated execution order (for log correlation).
     """
     if guard_active():
         return
-    if not rank_enabled():
+    if not _rank_ok():
         return
     if not _should_inspect(op_name, args):
         return
@@ -343,13 +346,26 @@ def inspect_after(op_name: str, args: tuple, result: Any,
         set_guard(False)
 
 
+def inspect_cleanup(op_name: str) -> None:
+    """Pop stale pairing left by inspect_before when the op raises.
+
+    Called from ``_call_with_hooks`` when the actual operator execution
+    fails so that the pairing stack stays clean for subsequent calls.
+    """
+    stack = getattr(_inspect_pairing, "stack", None)
+    if stack:
+        entries = stack.get(op_name)
+        if entries:
+            entries.pop()
+
+
 def enable_io_inspect(
     ops: Optional[Set[str]] = None,
     modules: Optional[Set[str]] = None,
     layers: Optional[Set[str]] = None,
     torch_funcs: bool = True,
     ranks: Optional[Set[int]] = None,
-    step_range: Optional[Tuple[int, int]] = None,
+    step_range: Optional[str] = None,
 ) -> None:
     """
     Programmatically enable IO inspection.
@@ -369,11 +385,12 @@ def enable_io_inspect(
         torch_funcs: Intercept bare torch functional ops. Default True
             (all intercepted). Set False to skip torch functions.
         ranks: Set of ranks to inspect on. None = all ranks.
-        step_range: (start, end) half-open step range [start, end).
-            Only log ops whose step falls in this range. None = all steps.
+        step_range: Inclusive step range string.  ``"0-2"`` means
+            steps 0, 1, 2.  A bare integer ``"5"`` means step 5 only.
+            None = all steps.
     """
     global _enabled, _match_all, _op_filter, _module_filter, _layer_filter
-    global _torch_funcs_enabled, _torch_func_filter, _step_range
+    global _torch_funcs_enabled, _torch_func_filter, _step_range, _rank_filter
 
     if ops is None and modules is None:
         _match_all = True
@@ -395,20 +412,22 @@ def enable_io_inspect(
 
     _torch_funcs_enabled = torch_funcs
     _torch_func_filter = set()
-    # If no step_range given explicitly, check env vars
-    if step_range is None:
-        step_range = parse_step_range_env(
+    # Parse step_range: accepts string "0-2" or None.
+    # parse_step_range handles inclusive→half-open conversion.
+    if step_range is not None:
+        _step_range = parse_step_range(step_range)
+    else:
+        _step_range = parse_step_range_env(
             "VLLM_FL_IO_INSPECT_STEP_RANGE", "VLLM_FL_IO_STEP_RANGE"
         )
-    _step_range = step_range
     _enabled = True
 
-    set_rank_filter(ranks)
+    _rank_filter = ranks
     _activate_hooks()
 
     # Propagate to env vars so child processes (e.g. vLLM EngineCore workers)
     # pick up the config via _init_from_env() on module import.
-    _set_env_vars(ops, modules, _layer_filter, torch_funcs, ranks, step_range)
+    _set_env_vars(ops, modules, _layer_filter, torch_funcs, ranks, _step_range)
 
     logger.info(
         f"IO Inspect enabled: rank={get_rank()}, "
@@ -486,7 +505,7 @@ if HAS_TORCH_FUNC_MODE:
     class _InspectTorchFuncMode(TorchFunctionMode):
         def __torch_function__(self, func, types, args=(), kwargs=None):
             kwargs = kwargs or {}
-            if torch.compiler.is_compiling() or not _enabled or guard_active() or not rank_enabled():
+            if torch.compiler.is_compiling() or not _enabled or guard_active() or not _rank_ok():
                 return func(*args, **kwargs)
 
             func_name = get_torch_func_name(func)
@@ -572,55 +591,25 @@ def _deactivate_hooks():
         _torch_func_mode_instance = None
 
 
-# ── Per-Model Hook Support (backward compatible) ──
-#
-# These hooks push/pop module context for specific named submodules,
-# mirroring the global hooks but on a per-model basis.
-
-
-def _should_hook_module(module: torch.nn.Module, name: str) -> bool:
-    """Check if a specific module instance should have hooks attached."""
-    if _match_all:
-        return True
-    cls_name = type(module).__name__
-    if cls_name in _module_filter:
-        return True
-    if name in _op_filter:
-        return True
-    return False
-
-
-def _make_pre_hook():
-    def hook(module, args):
-        cls_name = type(module).__name__
-        push_module_context(cls_name, module)
-    return hook
-
-
-def _make_post_hook():
-    def hook(module, args, output):
-        pop_module_context()
-    return hook
+# ── Per-Model Hook Support ──
 
 
 def attach_io_hooks(model: torch.nn.Module) -> int:
-    """
-    Attach IO inspect hooks to specific submodules of a model.
+    """Attach IO inspect hooks to specific submodules of a model.
 
     When using enable_io_inspect() with a modules filter, global hooks
     are registered automatically. Use this function only when you need
     hooks on specific named submodules.
     """
-    if not _enabled:
-        return 0
-    count = 0
-    for name, module in model.named_modules():
-        if not _should_hook_module(module, name):
-            continue
-        h1 = module.register_forward_pre_hook(_make_pre_hook())
-        h2 = module.register_forward_hook(_make_post_hook())
-        _hook_handles.extend([h1, h2])
-        count += 1
+    handles = attach_per_model_hooks(
+        model,
+        enabled=_enabled,
+        match_all=_match_all,
+        op_filter=_op_filter,
+        module_filter=_module_filter,
+    )
+    count = len(handles) // 2
+    _hook_handles.extend(handles)
     if count > 0:
         logger.info(f"[IO_INSPECT] Attached hooks to {count} modules")
     return count
@@ -628,15 +617,13 @@ def attach_io_hooks(model: torch.nn.Module) -> int:
 
 def remove_io_hooks() -> None:
     """Remove all per-model IO inspect hooks."""
-    for h in _hook_handles:
-        h.remove()
-    _hook_handles.clear()
+    remove_per_model_hooks(_hook_handles)
 
 
 def _reset_state() -> None:
     """Reset all module-level state to defaults."""
     global _enabled, _match_all, _op_filter, _module_filter, _layer_filter
-    global _torch_funcs_enabled, _torch_func_filter, _step_range
+    global _torch_funcs_enabled, _torch_func_filter, _step_range, _rank_filter
 
     _enabled = False
     _match_all = False
@@ -646,6 +633,7 @@ def _reset_state() -> None:
     _step_range = None
     _torch_funcs_enabled = False
     _torch_func_filter = set()
+    _rank_filter = None
 
 
 # ── Environment Initialization ──
@@ -654,7 +642,7 @@ def _reset_state() -> None:
 def _init_from_env() -> None:
     """Initialize from VLLM_FL_IO_INSPECT* environment variables or YAML config."""
     global _enabled, _match_all, _op_filter, _module_filter, _layer_filter
-    global _torch_funcs_enabled, _torch_func_filter, _step_range
+    global _torch_funcs_enabled, _torch_func_filter, _step_range, _rank_filter
 
     # Reset state first
     _deactivate_hooks()
@@ -686,12 +674,12 @@ def _init_from_env() -> None:
             _layer_filter = set(io_cfg.get("layers", set()))
             _enabled = True
 
-            set_rank_filter(io_cfg.get("ranks"))
+            _rank_filter = io_cfg.get("ranks")
             _activate_hooks()
 
             logger.info(
                 f"IO Inspect enabled (YAML): rank={get_rank()}, "
-                f"rank_filter={io_cfg.get('ranks') or 'all'}, "
+                f"rank_filter={_rank_filter or 'all'}, "
                 f"ops={_op_filter or 'all'}, modules={_module_filter or 'all'}, "
                 f"layers={_layer_filter or 'all'}, "
                 f"torch_funcs={_torch_funcs_enabled}, step_range={_step_range}"
@@ -746,13 +734,13 @@ def _init_from_env() -> None:
         # Parse rank filter (inspector-specific → shared fallback)
         rank_env = os.environ.get("VLLM_FL_IO_INSPECT_RANK", "") or os.environ.get("VLLM_FL_IO_RANK", "")
         if rank_env:
-            set_rank_filter(parse_rank_filter(rank_env))
+            _rank_filter = parse_rank_filter(rank_env)
 
         _activate_hooks()
 
         logger.info(
             f"IO Inspect enabled: rank={get_rank()}, "
-            f"rank_filter={parse_rank_filter(rank_env) if rank_env else 'all'}, "
+            f"rank_filter={_rank_filter or 'all'}, "
             f"ops={_op_filter or 'all'}, modules={_module_filter or 'all'}, "
             f"layers={_layer_filter or 'all'}, "
             f"torch_funcs={_torch_funcs_enabled}, step_range={_step_range}"

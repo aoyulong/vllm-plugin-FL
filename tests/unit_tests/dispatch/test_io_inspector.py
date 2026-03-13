@@ -27,12 +27,10 @@ from vllm_fl.dispatch._io_common import (
     parse_torch_funcs_config,
     pop_module_context,
     push_module_context,
-    rank_enabled,
     register_module_paths,
     reset_exec_order,
     reset_rank,
     reset_step,
-    set_rank_filter,
 )
 from vllm_fl.dispatch.io_inspector import (
     _parse_config,
@@ -823,7 +821,7 @@ class TestExecOrderParam:
 
         with caplog.at_level(logging.INFO, logger="vllm_fl.dispatch.io_inspect"):
             # Without prior inspect_before, falls back to outputs-only
-            inspect_after("op", (), torch.zeros(2), exec_order=42)
+            inspect_after("op", (), torch.zeros(2))
 
         assert any("[op=" in r.message for r in caplog.records)
 
@@ -843,11 +841,11 @@ class TestRankCommon:
 
     def setup_method(self):
         reset_rank()
-        set_rank_filter(None)
+        io_inspector._rank_filter = None
 
     def teardown_method(self):
         reset_rank()
-        set_rank_filter(None)
+        io_inspector._rank_filter = None
         os.environ.pop("RANK", None)
         os.environ.pop("LOCAL_RANK", None)
 
@@ -871,20 +869,20 @@ class TestRankCommon:
         r2 = get_rank()
         assert r1 == r2
 
-    def test_rank_enabled_all(self):
-        set_rank_filter(None)
-        assert rank_enabled()
+    def test_rank_filter_all(self):
+        io_inspector._rank_filter = None
+        assert io_inspector._rank_ok()
 
-    def test_rank_enabled_matching(self):
-        set_rank_filter({0})
+    def test_rank_filter_matching(self):
+        io_inspector._rank_filter = {0}
         reset_rank()
-        assert rank_enabled()
+        assert io_inspector._rank_ok()
 
     @patch.dict(os.environ, {"RANK": "1"}, clear=False)
-    def test_rank_enabled_not_matching(self):
+    def test_rank_filter_not_matching(self):
         reset_rank()
-        set_rank_filter({0})
-        assert not rank_enabled()
+        io_inspector._rank_filter = {0}
+        assert not io_inspector._rank_ok()
 
     def test_parse_rank_filter_all(self):
         assert parse_rank_filter("all") is None
@@ -909,12 +907,12 @@ class TestRankInInspectorLogs:
     def setup_method(self):
         disable_io_inspect()
         reset_rank()
-        set_rank_filter(None)
+        io_inspector._rank_filter = None
 
     def teardown_method(self):
         disable_io_inspect()
         reset_rank()
-        set_rank_filter(None)
+        io_inspector._rank_filter = None
 
     def test_rank_in_input_log(self, caplog):
         import logging
@@ -959,12 +957,12 @@ class TestRankFilterInInspector:
     def setup_method(self):
         disable_io_inspect()
         reset_rank()
-        set_rank_filter(None)
+        io_inspector._rank_filter = None
 
     def teardown_method(self):
         disable_io_inspect()
         reset_rank()
-        set_rank_filter(None)
+        io_inspector._rank_filter = None
         os.environ.pop("RANK", None)
 
     def test_rank_filter_blocks_inspection(self, caplog):
@@ -1002,7 +1000,7 @@ class TestRankFilterInInspector:
         reset_rank()
         io_inspector._init_from_env()
         assert is_inspect_enabled()
-        assert rank_enabled()
+        assert io_inspector._rank_ok()
 
     @patch.dict(
         os.environ,
@@ -1013,7 +1011,7 @@ class TestRankFilterInInspector:
         reset_rank()
         io_inspector._init_from_env()
         assert is_inspect_enabled()
-        assert not rank_enabled()
+        assert not io_inspector._rank_ok()
 
 
 class TestYamlRanksConfig:
@@ -1022,12 +1020,12 @@ class TestYamlRanksConfig:
     def setup_method(self):
         disable_io_inspect()
         reset_rank()
-        set_rank_filter(None)
+        io_inspector._rank_filter = None
 
     def teardown_method(self):
         disable_io_inspect()
         reset_rank()
-        set_rank_filter(None)
+        io_inspector._rank_filter = None
 
     def test_yaml_ranks_list(self):
         cfg_content = """
@@ -1078,10 +1076,10 @@ io_inspect:
             with patch.dict(os.environ, {"VLLM_FL_CONFIG": cfg_path}, clear=False):
                 io_inspector._init_from_env()
             assert is_inspect_enabled()
-            assert rank_enabled()
+            assert io_inspector._rank_ok()
         finally:
             os.unlink(cfg_path)
-            set_rank_filter(None)
+            io_inspector._rank_filter = None
 
 
 class TestStepSummary:
