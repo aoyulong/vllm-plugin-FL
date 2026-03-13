@@ -15,17 +15,23 @@ from vllm_fl.dispatch import io_inspector
 from vllm_fl.dispatch._io_common import (
     HAS_GLOBAL_MODULE_HOOKS,
     HAS_TORCH_FUNC_MODE,
+    advance_step,
     format_result,
     format_value,
     get_module_class_name,
     get_rank,
+    layer_path_matches,
     next_exec_order,
     parse_io_config_from_yaml,
     parse_rank_filter,
     parse_torch_funcs_config,
+    pop_module_context,
+    push_module_context,
     rank_enabled,
+    register_module_paths,
     reset_exec_order,
     reset_rank,
+    reset_step,
     set_rank_filter,
 )
 from vllm_fl.dispatch.io_inspector import (
@@ -97,6 +103,8 @@ class TestFormatValue:
         result = format_value(t)
         assert "shape=[4, 512]" in result
         assert "float16" in result
+        assert "min=" in result
+        assert "max=" in result
 
     def test_none(self):
         assert format_value(None) == "None"
@@ -262,16 +270,20 @@ class TestInspectBeforeAfter:
 
     def test_inspect_before_with_tensors(self):
         t = torch.zeros(2, 3, dtype=torch.float32)
-        # Should not raise
+        # Should not raise (stores inputs, no log yet)
         inspect_before("test_op", (t,), {})
+        # Complete the pairing
+        inspect_after("test_op", (t,), t)
 
     def test_inspect_before_with_module(self):
         m = torch.nn.Linear(10, 10)
         t = torch.zeros(2, 10)
         inspect_before("test_op", (m, t), {"epsilon": 1e-6})
+        inspect_after("test_op", (m, t), t)
 
     def test_inspect_after_with_tensor(self):
         t = torch.zeros(2, 3)
+        # Without inspect_before, falls back to outputs-only log
         inspect_after("test_op", (), t)
 
     def test_inspect_after_with_tuple(self):
@@ -281,6 +293,7 @@ class TestInspectBeforeAfter:
 
     def test_inspect_before_with_none_args(self):
         inspect_before("test_op", (None,), {})
+        inspect_after("test_op", (None,), None)
 
     def test_inspect_skips_when_filtered(self):
         disable_io_inspect()
@@ -442,9 +455,9 @@ class TestGlobalModuleHooks:
     )
     def test_global_hooks_auto_registered(self):
         enable_io_inspect(modules={"Linear"})
-        from vllm_fl.dispatch.io_inspector import _global_hook_handles
+        from vllm_fl.dispatch.io_inspector import _owns_global_hooks
 
-        assert len(_global_hook_handles) == 2  # pre + post
+        assert _owns_global_hooks is True
 
     @pytest.mark.skipif(
         not HAS_GLOBAL_MODULE_HOOKS,
@@ -469,12 +482,26 @@ class TestGlobalModuleHooks:
         reason="Global module hooks not available in this PyTorch version",
     )
     def test_global_hooks_removed_on_disable(self):
-        enable_io_inspect()
-        from vllm_fl.dispatch.io_inspector import _global_hook_handles
+        enable_io_inspect(modules={"Linear"})
+        from vllm_fl.dispatch.io_inspector import _owns_global_hooks
 
-        assert len(_global_hook_handles) == 2
+        assert _owns_global_hooks is True
         disable_io_inspect()
-        assert len(_global_hook_handles) == 0
+        from vllm_fl.dispatch import io_inspector
+
+        assert io_inspector._owns_global_hooks is False
+
+    @pytest.mark.skipif(
+        not HAS_GLOBAL_MODULE_HOOKS,
+        reason="Global module hooks not available in this PyTorch version",
+    )
+    def test_global_hooks_registered_in_match_all(self):
+        """In match-all mode, global module hooks ARE registered
+        to provide module context annotations on op/torch_func entries."""
+        enable_io_inspect()
+        from vllm_fl.dispatch.io_inspector import _owns_global_hooks
+
+        assert _owns_global_hooks is True
 
     @pytest.mark.skipif(
         not HAS_GLOBAL_MODULE_HOOKS,
@@ -554,8 +581,18 @@ class TestTorchFunctionMode:
         not HAS_TORCH_FUNC_MODE,
         reason="TorchFunctionMode not available in this PyTorch version",
     )
-    def test_torch_func_mode_not_activated_by_default(self):
-        enable_io_inspect()  # torch_funcs=False by default
+    def test_torch_func_mode_activated_by_default(self):
+        enable_io_inspect()  # torch_funcs=True by default
+        from vllm_fl.dispatch.io_inspector import _torch_func_mode_instance
+
+        assert _torch_func_mode_instance is not None
+
+    @pytest.mark.skipif(
+        not HAS_TORCH_FUNC_MODE,
+        reason="TorchFunctionMode not available in this PyTorch version",
+    )
+    def test_torch_func_mode_not_activated_when_disabled(self):
+        enable_io_inspect(torch_funcs=False)
         from vllm_fl.dispatch.io_inspector import _torch_func_mode_instance
 
         assert _torch_func_mode_instance is None
@@ -607,9 +644,17 @@ class TestEnvVarTorchFuncs:
         assert io_inspector._torch_func_filter == {"matmul", "softmax"}
 
     @patch.dict(os.environ, {"VLLM_FL_IO_INSPECT": "1"}, clear=False)
-    def test_env_torch_funcs_unset(self):
+    def test_env_torch_funcs_unset_match_all(self):
         os.environ.pop("VLLM_FL_IO_INSPECT_TORCH_FUNCS", None)
         io_inspector._init_from_env()
+        # torch_funcs defaults to True in match-all mode
+        assert io_inspector._torch_funcs_enabled
+
+    @patch.dict(os.environ, {"VLLM_FL_IO_INSPECT": "rms_norm"}, clear=False)
+    def test_env_torch_funcs_unset_filtered(self):
+        os.environ.pop("VLLM_FL_IO_INSPECT_TORCH_FUNCS", None)
+        io_inspector._init_from_env()
+        # torch_funcs defaults to False when specific ops are filtered
         assert not io_inspector._torch_funcs_enabled
 
 
@@ -624,18 +669,19 @@ class TestExecOrder:
         disable_io_inspect()
         reset_exec_order()
 
-    def test_exec_order_in_log(self, caplog):
+    def test_op_tag_in_log(self, caplog):
         import logging
 
-        enable_io_inspect()
+        enable_io_inspect(torch_funcs=False)
         reset_exec_order()
 
         with caplog.at_level(logging.INFO, logger="vllm_fl.dispatch.io_inspect"):
             t = torch.zeros(2, 3)
             inspect_before("test_op", (t,), {})
+            inspect_after("test_op", (t,), t)
 
-        # Check that exec order number appears in log
-        assert any("#" in r.message for r in caplog.records)
+        # Check that op counter tag appears in consolidated log
+        assert any("[op=" in r.message for r in caplog.records)
 
     def test_exec_order_increments_across_ops(self):
         reset_exec_order()
@@ -759,30 +805,34 @@ class TestExecOrderParam:
         disable_io_inspect()
         reset_exec_order()
 
-    def test_inspect_before_uses_given_order(self, caplog):
+    def test_inspect_before_uses_op_tag(self, caplog):
         import logging
 
         enable_io_inspect()
 
         with caplog.at_level(logging.INFO, logger="vllm_fl.dispatch.io_inspect"):
             inspect_before("op", (torch.zeros(2),), {}, exec_order=42)
+            inspect_after("op", (torch.zeros(2),), torch.zeros(2))
 
-        assert any("#42" in r.message for r in caplog.records)
+        assert any("[op=" in r.message for r in caplog.records)
 
-    def test_inspect_after_uses_given_order(self, caplog):
+    def test_inspect_after_uses_op_tag(self, caplog):
         import logging
 
         enable_io_inspect()
 
         with caplog.at_level(logging.INFO, logger="vllm_fl.dispatch.io_inspect"):
+            # Without prior inspect_before, falls back to outputs-only
             inspect_after("op", (), torch.zeros(2), exec_order=42)
 
-        assert any("#42" in r.message for r in caplog.records)
+        assert any("[op=" in r.message for r in caplog.records)
 
     def test_exec_order_none_allocates_internally(self):
-        enable_io_inspect()
+        enable_io_inspect(torch_funcs=False)
         reset_exec_order()
-        inspect_before("op", (torch.zeros(2),), {})
+        t = torch.zeros(2)
+        inspect_before("op", (t,), {})
+        inspect_after("op", (t,), t)
         from vllm_fl.dispatch._io_common import get_exec_order
 
         assert get_exec_order() >= 1
@@ -872,7 +922,9 @@ class TestRankInInspectorLogs:
         enable_io_inspect()
 
         with caplog.at_level(logging.INFO, logger="vllm_fl.dispatch.io_inspect"):
-            inspect_before("op", (torch.zeros(2),), {})
+            t = torch.zeros(2)
+            inspect_before("op", (t,), {})
+            inspect_after("op", (t,), t)
 
         assert any("[rank=0]" in r.message for r in caplog.records)
 
@@ -894,7 +946,9 @@ class TestRankInInspectorLogs:
         enable_io_inspect()
 
         with caplog.at_level(logging.INFO, logger="vllm_fl.dispatch.io_inspect"):
-            inspect_before("op", (torch.zeros(2),), {})
+            t = torch.zeros(2)
+            inspect_before("op", (t,), {})
+            inspect_after("op", (t,), t)
 
         assert any("[rank=7]" in r.message for r in caplog.records)
 
@@ -920,7 +974,9 @@ class TestRankFilterInInspector:
         reset_rank()
 
         with caplog.at_level(logging.INFO, logger="vllm_fl.dispatch.io_inspect"):
-            inspect_before("op", (torch.zeros(2),), {})
+            t = torch.zeros(2)
+            inspect_before("op", (t,), {})
+            inspect_after("op", (t,), t)
 
         assert not any("INPUTS" in r.message for r in caplog.records)
 
@@ -931,7 +987,9 @@ class TestRankFilterInInspector:
         enable_io_inspect(ranks={0})
 
         with caplog.at_level(logging.INFO, logger="vllm_fl.dispatch.io_inspect"):
-            inspect_before("op", (torch.zeros(2),), {})
+            t = torch.zeros(2)
+            inspect_before("op", (t,), {})
+            inspect_after("op", (t,), t)
 
         assert any("INPUTS" in r.message for r in caplog.records)
 
@@ -1024,3 +1082,192 @@ io_inspect:
         finally:
             os.unlink(cfg_path)
             set_rank_filter(None)
+
+
+class TestStepSummary:
+    """Test that advance_step logs a summary of seen modules and ops."""
+
+    def test_step_advance_logs_summary(self, caplog):
+        """After inspect_before/inspect_after, advance_step should log a summary."""
+        enable_io_inspect()
+        try:
+            t = torch.zeros(2)
+            inspect_before("test_op", (t,), {})
+            inspect_after("test_op", (t,), t)
+            caplog.clear()
+            with caplog.at_level("INFO"):
+                advance_step()
+            summary_msgs = [
+                r.message for r in caplog.records if "Step summary" in r.message
+            ]
+            assert len(summary_msgs) == 1
+            assert "test_op" in summary_msgs[0]
+        finally:
+            disable_io_inspect()
+            reset_step()
+
+    def test_no_summary_when_no_ops(self, caplog):
+        """If no ops were inspected, no summary should be logged."""
+        enable_io_inspect()
+        try:
+            caplog.clear()
+            with caplog.at_level("INFO"):
+                advance_step()
+            summary_msgs = [
+                r.message for r in caplog.records if "Step summary" in r.message
+            ]
+            assert len(summary_msgs) == 0
+        finally:
+            disable_io_inspect()
+            reset_step()
+
+
+class TestLayerFilter:
+    """Test layer path filtering for IO inspector."""
+
+    def setup_method(self):
+        disable_io_inspect()
+        # Build a simple model and register its paths
+        self.model = torch.nn.Sequential(
+            torch.nn.Linear(4, 3),
+            torch.nn.ReLU(),
+            torch.nn.Linear(3, 2),
+        )
+        register_module_paths(self.model)
+
+    def teardown_method(self):
+        disable_io_inspect()
+
+    def test_layer_filter_state(self):
+        enable_io_inspect(layers={"model.layers.0"})
+        assert io_inspector._layer_filter == {"model.layers.0"}
+
+    def test_layer_filter_resets(self):
+        enable_io_inspect(layers={"model.layers.0"})
+        disable_io_inspect()
+        assert io_inspector._layer_filter == set()
+
+    def test_layer_path_matches_exact(self):
+        """Test exact path matching."""
+        push_module_context("Linear", self.model[0])
+        try:
+            assert layer_path_matches({"0"})
+        finally:
+            pop_module_context()
+
+    def test_layer_path_matches_prefix(self):
+        """Test prefix matching with dot boundary."""
+        # "0" is the path for self.model[0] (Sequential names children 0, 1, 2)
+        push_module_context("Linear", self.model[0])
+        try:
+            # "0" is the exact path, so it should match
+            assert layer_path_matches({"0"})
+        finally:
+            pop_module_context()
+
+    def test_layer_path_no_match(self):
+        """Test that non-matching prefix is rejected."""
+        push_module_context("Linear", self.model[0])
+        try:
+            assert not layer_path_matches({"model.layers.99"})
+        finally:
+            pop_module_context()
+
+    def test_layer_path_no_partial_segment_match(self):
+        """Prefix 'model.layers.0' should NOT match 'model.layers.00'."""
+        push_module_context("Linear", self.model[0])
+        try:
+            # Path for model[0] is "0", should not match prefix "00"
+            assert not layer_path_matches({"00"})
+        finally:
+            pop_module_context()
+
+    @patch.dict(
+        os.environ,
+        {"VLLM_FL_IO_INSPECT": "1", "VLLM_FL_IO_INSPECT_LAYERS": "0"},
+        clear=False,
+    )
+    def test_env_layer_filter(self):
+        io_inspector._init_from_env()
+        assert io_inspector._layer_filter == {"model.layers.0"}
+
+    @patch.dict(
+        os.environ,
+        {
+            "VLLM_FL_IO_INSPECT": "1",
+            "VLLM_FL_IO_LAYERS": "model.layers.0,model.layers.1",
+        },
+        clear=False,
+    )
+    def test_env_shared_layer_filter(self):
+        os.environ.pop("VLLM_FL_IO_INSPECT_LAYERS", None)
+        io_inspector._init_from_env()
+        assert io_inspector._layer_filter == {"model.layers.0", "model.layers.1"}
+
+    @pytest.mark.skipif(
+        not HAS_GLOBAL_MODULE_HOOKS,
+        reason="Global module hooks not available in this PyTorch version",
+    )
+    def test_layer_filter_acquires_module_hooks(self):
+        """Layer filter needs module hooks for path tracking."""
+        enable_io_inspect(ops={"rms_norm"}, layers={"model.layers.0"})
+        assert io_inspector._owns_global_hooks is True
+
+    def test_layer_shorthand_expansion(self):
+        """Integer shorthand and ranges should be expanded."""
+        enable_io_inspect(layers={"0", "2-4"})
+        assert "model.layers.0" in io_inspector._layer_filter
+        assert "model.layers.2" in io_inspector._layer_filter
+        assert "model.layers.3" in io_inspector._layer_filter
+        assert "model.layers.4" in io_inspector._layer_filter
+
+    def test_layer_glob_pattern(self):
+        """Glob patterns should be kept as-is."""
+        enable_io_inspect(layers={"model.layers.*.self_attn"})
+        assert "model.layers.*.self_attn" in io_inspector._layer_filter
+
+    @patch.dict(
+        os.environ,
+        {"VLLM_FL_IO_INSPECT": "1", "VLLM_FL_IO_INSPECT_LAYERS": "0,1-2"},
+        clear=False,
+    )
+    def test_env_layer_expansion(self):
+        """Env var layer specs should be expanded."""
+        io_inspector._init_from_env()
+        assert "model.layers.0" in io_inspector._layer_filter
+        assert "model.layers.1" in io_inspector._layer_filter
+        assert "model.layers.2" in io_inspector._layer_filter
+
+
+class TestComposableFilters:
+    """Test AND-based composable filter logic."""
+
+    def setup_method(self):
+        disable_io_inspect()
+
+    def teardown_method(self):
+        disable_io_inspect()
+
+    def test_op_and_module_filter(self):
+        """When both op and module filter are set, both must match (AND)."""
+        enable_io_inspect(ops={"rms_norm"}, modules={"Linear"})
+        m = torch.nn.Linear(10, 10)
+        # rms_norm inside Linear → True
+        assert _should_inspect("rms_norm", (m,))
+        # silu_and_mul inside Linear → False (op doesn't match)
+        assert not _should_inspect("silu_and_mul", (m,))
+        # rms_norm outside Linear → False (module doesn't match)
+        assert not _should_inspect("rms_norm", (torch.zeros(2),))
+
+    def test_op_filter_only(self):
+        """When only op filter is set, only op must match."""
+        enable_io_inspect(ops={"rms_norm"})
+        assert _should_inspect("rms_norm", ())
+        assert not _should_inspect("silu_and_mul", ())
+
+    def test_module_filter_only(self):
+        """When only module filter is set, only module must match."""
+        enable_io_inspect(modules={"Linear"})
+        m = torch.nn.Linear(10, 10)
+        assert _should_inspect("any_op", (m,))
+        assert not _should_inspect("any_op", (torch.zeros(2),))

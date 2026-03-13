@@ -117,6 +117,7 @@ from .io_dumper import (
     attach_dump_hooks,
     remove_dump_hooks,
 )
+from ._io_common import list_model_layers, register_tensor_stat, tensor_stats
 
 
 def call_op(op_name: str, *args, **kwargs):
@@ -195,6 +196,9 @@ __all__ = [
     "io_dump_step",
     "attach_dump_hooks",
     "remove_dump_hooks",
+    "list_model_layers",
+    "register_tensor_stat",
+    "tensor_stats",
     # Convenience functions
     "call_op",
     "resolve_op",
