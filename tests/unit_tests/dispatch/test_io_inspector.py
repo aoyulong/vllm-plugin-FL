@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from vllm_fl.dispatch import io_inspector
-from vllm_fl.dispatch._io_common import (
+from vllm_fl.dispatch.io_common import (
     HAS_GLOBAL_MODULE_HOOKS,
     HAS_TORCH_FUNC_MODE,
     advance_step,
@@ -36,13 +36,11 @@ from vllm_fl.dispatch.io_inspector import (
     _parse_config,
     _should_inspect,
     _should_inspect_torch_func,
-    attach_io_hooks,
     disable_io_inspect,
     enable_io_inspect,
     inspect_after,
     inspect_before,
     is_inspect_enabled,
-    remove_io_hooks,
 )
 
 
@@ -301,80 +299,6 @@ class TestInspectBeforeAfter:
         inspect_after("test_op", (torch.zeros(2),), torch.zeros(2))
 
 
-class TestForwardHooks:
-    """Test nn.Module forward hook attachment."""
-
-    def setup_method(self):
-        disable_io_inspect()
-
-    def teardown_method(self):
-        disable_io_inspect()
-
-    def test_attach_hooks_all(self):
-        enable_io_inspect()
-        model = torch.nn.Sequential(
-            torch.nn.Linear(10, 5),
-            torch.nn.ReLU(),
-            torch.nn.Linear(5, 2),
-        )
-        count = attach_io_hooks(model)
-        # Sequential + 3 children + submodules = at least 4
-        assert count >= 4
-        remove_io_hooks()
-
-    def test_attach_hooks_by_module_filter(self):
-        enable_io_inspect(modules={"Linear"})
-        model = torch.nn.Sequential(
-            torch.nn.Linear(10, 5),
-            torch.nn.ReLU(),
-            torch.nn.Linear(5, 2),
-        )
-        count = attach_io_hooks(model)
-        assert count == 2  # Only the two Linear modules
-        remove_io_hooks()
-
-    def test_hooks_fire_on_forward(self, caplog):
-        import logging
-
-        enable_io_inspect(modules={"Linear"})
-        model = torch.nn.Linear(4, 3)
-        attach_io_hooks(model)
-
-        with caplog.at_level(logging.INFO, logger="vllm_fl.dispatch.io_inspect"):
-            x = torch.randn(2, 4)
-            model(x)
-
-        # Check that both input and output were logged
-        assert any("INPUTS" in r.message for r in caplog.records)
-        assert any("OUTPUTS" in r.message for r in caplog.records)
-        remove_io_hooks()
-
-    def test_remove_hooks(self):
-        enable_io_inspect()
-        model = torch.nn.Linear(4, 3)
-        attach_io_hooks(model)
-        remove_io_hooks()
-        # After removal, hooks should not fire (no crash at least)
-        x = torch.randn(2, 4)
-        model(x)
-
-    def test_attach_disabled_returns_zero(self):
-        # When disabled, attach should be a no-op
-        model = torch.nn.Linear(4, 3)
-        count = attach_io_hooks(model)
-        assert count == 0
-
-    def test_disable_removes_hooks(self):
-        enable_io_inspect()
-        model = torch.nn.Linear(4, 3)
-        attach_io_hooks(model)
-        disable_io_inspect()
-        # Hooks should be removed
-        from vllm_fl.dispatch.io_inspector import _hook_handles
-
-        assert len(_hook_handles) == 0
-
-
 class TestParseTorchFuncsConfig:
     """Test parse_torch_funcs_config parsing logic."""
 
@@ -462,7 +386,7 @@ class TestGlobalModuleHooks:
         reason="Global module hooks not available in this PyTorch version",
     )
     def test_global_hooks_fire_without_attach(self, caplog):
-        """Global hooks should fire without calling attach_io_hooks()."""
+        """Global hooks should fire when inspect is enabled."""
         import logging
 
         enable_io_inspect(modules={"Linear"})
@@ -831,13 +755,13 @@ class TestExecOrderParam:
         t = torch.zeros(2)
         inspect_before("op", (t,), {})
         inspect_after("op", (t,), t)
-        from vllm_fl.dispatch._io_common import get_exec_order
+        from vllm_fl.dispatch.io_common import get_exec_order
 
         assert get_exec_order() >= 1
 
 
 class TestRankCommon:
-    """Test rank detection and filtering utilities in _io_common."""
+    """Test rank detection and filtering utilities in io_common."""
 
     def setup_method(self):
         reset_rank()

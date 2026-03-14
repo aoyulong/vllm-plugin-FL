@@ -80,13 +80,12 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 
-from ._io_common import (
+from .io_common import (
     HAS_TORCH_FUNC_MODE,
     TorchFunctionMode,
     acquire_global_module_hooks,
     acquire_torch_func_tags,
     advance_step,
-    attach_per_model_hooks,
     expand_layer_specs,
     get_module_class_name,
     get_rank,
@@ -109,7 +108,6 @@ from ._io_common import (
     register_step_callback,
     release_global_module_hooks,
     release_torch_func_tags,
-    remove_per_model_hooks,
     should_inspect_torch_func,
     tensor_stats,
     unregister_step_callback,
@@ -157,7 +155,6 @@ def _rank_ok() -> bool:
 
 
 # Hook handles
-_hook_handles: List[Any] = []
 _torch_func_mode_instance: Optional[Any] = None
 _owns_global_hooks: bool = False
 
@@ -392,7 +389,7 @@ def _append_to_json(json_path: str, key: str, value: dict) -> None:
         os.replace(tmp_path, json_path)
 
 
-# ── Dump helpers ──
+# ── Dump I/O ──
 
 
 def _dump_input(op_name: str, args: tuple, kwargs: dict,
@@ -546,7 +543,7 @@ def dump_cleanup(op_name: str) -> None:
 def io_dump_step() -> int:
     """Increment step counter and reset per-op call counters.
 
-    Uses the shared step counter from _io_common so the inspector
+    Uses the shared step counter from io_common so the inspector
     and dumper stay in sync.  The ``_on_step_advance`` callback
     registered by ``_activate_hooks`` clears per-op call counters.
     """
@@ -557,7 +554,7 @@ def enable_io_dump(
     dump_dir: str = "",
     ops: Optional[Set[str]] = None,
     modules: Optional[Set[str]] = None,
-    layers: Optional[Set[str]] = None,
+    layers=None,
     max_calls: int = 0,
     step_range: Optional[str] = None,
     torch_funcs: bool = True,
@@ -614,6 +611,8 @@ def enable_io_dump(
             "VLLM_FL_IO_DUMP_LAYERS", "VLLM_FL_IO_LAYERS"
         )
     else:
+        if isinstance(layers, str):
+            layers = {layers}
         layers = expand_layer_specs(layers)
     _layer_filter = set(layers) if layers else set()
 
@@ -653,7 +652,6 @@ def disable_io_dump() -> None:
     """Programmatically disable IO dumping and remove all hooks."""
     _reset_state()
     _deactivate_hooks()
-    remove_dump_hooks()
     _clear_env_vars()
 
 
@@ -773,7 +771,7 @@ if HAS_TORCH_FUNC_MODE:
             return result
 
 
-# ── Hook Lifecycle ──
+# ── Hook lifecycle ──
 
 
 def _activate_hooks():
@@ -813,35 +811,7 @@ def _deactivate_hooks():
         _torch_func_mode_instance = None
 
 
-# ── Per-Model Hook Support ──
-
-
-def attach_dump_hooks(model: torch.nn.Module) -> int:
-    """Attach IO dump hooks to specific submodules of a model.
-
-    When using enable_io_dump() with a modules filter, global hooks
-    are registered automatically. Use this for targeted per-model hooks.
-    """
-    handles = attach_per_model_hooks(
-        model,
-        enabled=_enabled,
-        match_all=_match_all,
-        op_filter=_op_filter,
-        module_filter=_module_filter,
-    )
-    count = len(handles) // 2
-    _hook_handles.extend(handles)
-    if count > 0:
-        logger.info(f"[IO_DUMP] Attached dump hooks to {count} modules")
-    return count
-
-
-def remove_dump_hooks() -> None:
-    """Remove all per-model IO dump hooks."""
-    remove_per_model_hooks(_hook_handles)
-
-
-# ── Environment Initialization ──
+# ── State management ──
 
 
 def _reset_state() -> None:

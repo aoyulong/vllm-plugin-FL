@@ -234,7 +234,7 @@ def _maybe_advance_io_step() -> None:
     """
     global _io_advance_step, _io_inspect_enabled, _io_dump_enabled
     if _io_advance_step is None:
-        from vllm_fl.dispatch._io_common import advance_step
+        from vllm_fl.dispatch.io_common import advance_step
         from vllm_fl.dispatch.io_inspector import is_inspect_enabled
         from vllm_fl.dispatch.io_dumper import is_dump_enabled
         _io_advance_step = advance_step
@@ -3729,7 +3729,7 @@ class ModelRunnerFL(
         # Always register module paths — cheap (one pass over named_modules)
         # and required by all three IO configuration methods (env vars, YAML,
         # and the Python API) for layer-path filtering to work.
-        from vllm_fl.dispatch._io_common import register_module_paths
+        from vllm_fl.dispatch.io_common import register_module_paths
         register_module_paths(self.model)
         # Import io_inspector/io_dumper to trigger _init_from_env() only when
         # configured via env vars or YAML config.  Python API users import

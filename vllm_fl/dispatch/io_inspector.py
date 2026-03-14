@@ -73,12 +73,11 @@ from typing import Any, List, Optional, Set, Tuple
 
 import torch
 
-from ._io_common import (
+from .io_common import (
     HAS_TORCH_FUNC_MODE,
     TorchFunctionMode,
     acquire_global_module_hooks,
     acquire_torch_func_tags,
-    attach_per_model_hooks,
     expand_layer_specs,
     format_result,
     format_value,
@@ -103,7 +102,6 @@ from ._io_common import (
     register_step_callback,
     release_global_module_hooks,
     release_torch_func_tags,
-    remove_per_model_hooks,
     should_inspect_torch_func,
     unregister_step_callback,
 )
@@ -135,7 +133,6 @@ def _rank_ok() -> bool:
 
 
 # Hook handles
-_hook_handles: List[Any] = []          # Per-model hooks (attach_io_hooks)
 _torch_func_mode_instance: Optional[Any] = None
 _owns_global_hooks: bool = False       # Whether we acquired global module hooks
 
@@ -215,7 +212,7 @@ def _parse_config(value: str) -> Tuple[bool, Set[str], Set[str]]:
     return False, ops, modules
 
 
-# ── Logging helpers ──
+# ── Formatting ──
 
 
 def _format_inputs(args: tuple, kwargs: dict,
@@ -365,7 +362,7 @@ def inspect_cleanup(op_name: str) -> None:
 def enable_io_inspect(
     ops: Optional[Set[str]] = None,
     modules: Optional[Set[str]] = None,
-    layers: Optional[Set[str]] = None,
+    layers=None,
     torch_funcs: bool = True,
     ranks: Optional[Set[int]] = None,
     step_range: Optional[str] = None,
@@ -410,6 +407,8 @@ def enable_io_inspect(
             "VLLM_FL_IO_INSPECT_LAYERS", "VLLM_FL_IO_LAYERS"
         )
     else:
+        if isinstance(layers, str):
+            layers = {layers}
         layers = expand_layer_specs(layers)
     _layer_filter = set(layers) if layers else set()
 
@@ -445,7 +444,6 @@ def disable_io_inspect() -> None:
     """Programmatically disable IO inspection and remove all hooks."""
     _reset_state()
     _deactivate_hooks()
-    remove_io_hooks()
     _clear_env_vars()
 
 
@@ -555,7 +553,7 @@ def _on_step_summary(step: int, seen_modules: Set[str], seen_ops: Set[str]) -> N
     )
 
 
-# ── Hook Lifecycle ──
+# ── Hook lifecycle ──
 
 
 def _activate_hooks():
@@ -594,33 +592,7 @@ def _deactivate_hooks():
         _torch_func_mode_instance = None
 
 
-# ── Per-Model Hook Support ──
-
-
-def attach_io_hooks(model: torch.nn.Module) -> int:
-    """Attach IO inspect hooks to specific submodules of a model.
-
-    When using enable_io_inspect() with a modules filter, global hooks
-    are registered automatically. Use this function only when you need
-    hooks on specific named submodules.
-    """
-    handles = attach_per_model_hooks(
-        model,
-        enabled=_enabled,
-        match_all=_match_all,
-        op_filter=_op_filter,
-        module_filter=_module_filter,
-    )
-    count = len(handles) // 2
-    _hook_handles.extend(handles)
-    if count > 0:
-        logger.info(f"[IO_INSPECT] Attached hooks to {count} modules")
-    return count
-
-
-def remove_io_hooks() -> None:
-    """Remove all per-model IO inspect hooks."""
-    remove_per_model_hooks(_hook_handles)
+# ── State management ──
 
 
 def _reset_state() -> None:
@@ -639,7 +611,7 @@ def _reset_state() -> None:
     _rank_filter = None
 
 
-# ── Environment Initialization ──
+# ── State management ──
 
 
 def _init_from_env() -> None:

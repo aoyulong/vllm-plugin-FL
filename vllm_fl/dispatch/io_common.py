@@ -39,7 +39,7 @@ try:
 except ImportError:
     HAS_GLOBAL_MODULE_HOOKS = False
 
-# ── Distributed rank detection ──
+# ── Distributed rank ──
 
 _rank: Optional[int] = None  # cached after first call
 
@@ -82,9 +82,6 @@ def reset_rank() -> None:
     """Reset cached rank (for testing only)."""
     global _rank
     _rank = None
-
-
-# ── Rank filter parsing ──
 
 
 def parse_rank_filter(value: str) -> Optional[Set[int]]:
@@ -133,6 +130,210 @@ def make_guard():
         _tls.active = active
 
     return guard_active, set_guard
+
+
+# ── Execution order tracking ──
+
+_exec_order_counter: int = 0
+_exec_order_lock = threading.Lock()
+
+
+def next_exec_order() -> int:
+    """Get the next global execution order number (thread-safe).
+
+    This provides a monotonically increasing counter across all
+    intercepted ops, allowing users to align output with model
+    definition order.
+    """
+    global _exec_order_counter
+    with _exec_order_lock:
+        _exec_order_counter += 1
+        return _exec_order_counter
+
+
+def reset_exec_order() -> None:
+    """Reset the execution order counter (e.g. at step boundaries)."""
+    global _exec_order_counter
+    with _exec_order_lock:
+        _exec_order_counter = 0
+
+
+def get_exec_order() -> int:
+    """Get the current execution order counter value (without incrementing)."""
+    return _exec_order_counter
+
+
+# ── Per-step counters ──
+#
+# module counter: each unique module class name gets a monotonic index (0,1,2,…)
+# and a per-class call count, both reset each step.
+# op counter: same for ops/torch funcs.
+# seen sets: track which modules/ops were encountered this step (for summary).
+
+_module_type_index: Dict[str, int] = {}
+_module_type_count: Dict[str, int] = {}
+_module_next_idx: int = 0
+
+_op_type_index: Dict[str, int] = {}
+_op_type_count: Dict[str, int] = {}
+_op_next_idx: int = 0
+
+_seen_modules: Set[str] = set()
+_seen_ops: Set[str] = set()
+
+_counter_lock = threading.Lock()
+
+
+def next_module_counter(cls_name: str) -> Tuple[int, int]:
+    """Get (type_index, call_count) for a module class this step, incrementing call count."""
+    global _module_next_idx
+    with _counter_lock:
+        if cls_name not in _module_type_index:
+            _module_type_index[cls_name] = _module_next_idx
+            _module_next_idx += 1
+            _module_type_count[cls_name] = 0
+        _module_type_count[cls_name] += 1
+        return _module_type_index[cls_name], _module_type_count[cls_name]
+
+
+def next_op_counter(op_name: str) -> Tuple[int, int]:
+    """Get (type_index, call_count) for an op this step, incrementing call count."""
+    global _op_next_idx
+    with _counter_lock:
+        if op_name not in _op_type_index:
+            _op_type_index[op_name] = _op_next_idx
+            _op_next_idx += 1
+            _op_type_count[op_name] = 0
+        _op_type_count[op_name] += 1
+        return _op_type_index[op_name], _op_type_count[op_name]
+
+
+def _reset_per_step_counters() -> Tuple[Set[str], Set[str]]:
+    """Reset module/op counters and seen sets for a new step.
+
+    Returns:
+        (seen_modules, seen_ops) from the completed step.
+    """
+    global _module_next_idx, _op_next_idx
+    with _counter_lock:
+        seen_modules = _seen_modules.copy()
+        seen_ops = _seen_ops.copy()
+        _seen_modules.clear()
+        _seen_ops.clear()
+        _module_type_index.clear()
+        _module_type_count.clear()
+        _module_next_idx = 0
+        _op_type_index.clear()
+        _op_type_count.clear()
+        _op_next_idx = 0
+    return seen_modules, seen_ops
+
+
+# ── Step tracking (shared by inspector and dumper) ──
+
+_step_counter: int = 0  # first forward pass runs at step 0
+_step_lock = threading.Lock()
+_step_callbacks: List[Any] = []  # called on each step advance
+
+
+def get_step() -> int:
+    """Get the current step counter value."""
+    return _step_counter
+
+
+def advance_step() -> int:
+    """Increment the step counter and reset execution order (thread-safe).
+
+    Returns the new step number.  Also resets per-step counters and
+    fires registered step callbacks with the summary of the completed step.
+    """
+    global _step_counter
+    with _step_lock:
+        prev_step = _step_counter
+        _step_counter += 1
+        result = _step_counter
+        callbacks = list(_step_callbacks)
+    reset_exec_order()
+    seen_modules, seen_ops = _reset_per_step_counters()
+    for cb in callbacks:
+        try:
+            cb(prev_step, seen_modules, seen_ops)
+        except Exception:
+            _logger.warning("Step callback %s failed", cb.__name__, exc_info=True)
+    return result
+
+
+def reset_step() -> None:
+    """Reset the step counter to 0 (for testing)."""
+    global _step_counter
+    with _step_lock:
+        _step_counter = 0
+    _reset_per_step_counters()
+
+
+def register_step_callback(cb) -> None:
+    """Register a callback to be called on each step advancement.
+
+    Callbacks receive (step, seen_modules, seen_ops) for the completed step.
+    """
+    with _step_lock:
+        if cb not in _step_callbacks:
+            _step_callbacks.append(cb)
+
+
+def unregister_step_callback(cb) -> None:
+    """Remove a previously registered step callback."""
+    with _step_lock:
+        try:
+            _step_callbacks.remove(cb)
+        except ValueError:
+            pass
+
+
+def parse_step_range(value) -> Optional[Tuple[int, int]]:
+    """Parse a step range string into a half-open tuple for internal use.
+
+    Accepted formats (all inclusive):
+    - ``"start-end"``: ``"0-2"`` → ``(0, 3)`` (steps 0, 1, 2)
+    - Bare integer: ``"5"`` → ``(5, 6)`` (step 5 only)
+
+    Returns ``None`` if the value is ``None``, empty, or cannot be parsed.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if "-" in value:
+        parts = value.split("-", 1)
+        try:
+            return (int(parts[0].strip()), int(parts[1].strip()) + 1)
+        except ValueError:
+            return None
+    elif value.isdigit():
+        s = int(value)
+        return (s, s + 1)
+    return None
+
+
+def parse_step_range_env(*env_vars: str) -> Optional[Tuple[int, int]]:
+    """Parse a step range from the first non-empty env var.
+
+    Checks each env var in order; returns the first valid ``(start, end)``
+    half-open tuple or ``None``.  Accepts ``"start-end"`` inclusive dash
+    format (e.g. ``"0-1"`` → ``(0, 2)``) or a bare integer (e.g. ``"0"``
+    → ``(0, 1)``).
+    """
+    for var in env_vars:
+        value = os.environ.get(var, "").strip()
+        if not value:
+            continue
+        result = parse_step_range(value)
+        if result is not None:
+            return result
+    return None
 
 
 # ── Module path registry ──
@@ -233,42 +434,18 @@ def get_current_module_path() -> str:
     return ""
 
 
-def layer_path_matches(filter_set: Set[str]) -> bool:
-    """Check if any module in the current call stack has a matching layer path.
-
-    Supports three matching modes (determined per filter entry):
-    - **Exact/prefix**: ``"model.layers.0"`` matches ``"model.layers.0"``
-      and ``"model.layers.0.self_attn"`` but NOT ``"model.layers.00"``.
-    - **Glob/wildcard**: entries containing ``*`` or ``?`` are matched
-      with :func:`fnmatch.fnmatch`.  E.g. ``"model.layers.*.self_attn"``
-      matches ``"model.layers.0.self_attn"``, ``"model.layers.1.self_attn"``.
-    """
-    stack = getattr(_module_context, "stack", None)
-    if not stack:
-        return False
-    for entry in reversed(stack):
-        path = entry[3]
-        if path:
-            for pattern in filter_set:
-                if _is_glob(pattern):
-                    if fnmatch.fnmatch(path, pattern):
-                        return True
-                else:
-                    if path == pattern or path.startswith(pattern + "."):
-                        return True
-    return False
-
-
-def _is_glob(s: str) -> bool:
-    """Check if a string contains glob wildcard characters."""
-    return "*" in s or "?" in s
-
+# ── Layer filtering ──
 
 # Range pattern for layer specs like "0-3", "10-15"
 _RANGE_RE = re.compile(r"^(\d+)-(\d+)$")
 
 # Default prefix for integer shorthand expansion
 DEFAULT_LAYER_PREFIX = "model.layers."
+
+
+def _is_glob(s: str) -> bool:
+    """Check if a string contains glob wildcard characters."""
+    return "*" in s or "?" in s
 
 
 def expand_layer_specs(
@@ -332,7 +509,7 @@ def list_model_layers(
 
     Example::
 
-        from vllm_fl.dispatch._io_common import list_model_layers
+        from vllm_fl.dispatch.io_common import list_model_layers
         list_model_layers(model, max_depth=2)
     """
     paths: List[str] = []
@@ -354,7 +531,47 @@ def list_model_layers(
     return paths
 
 
-# ── Torch function filtering constants ──
+def layer_path_matches(filter_set: Set[str]) -> bool:
+    """Check if any module in the current call stack has a matching layer path.
+
+    Supports three matching modes (determined per filter entry):
+    - **Exact/prefix**: ``"model.layers.0"`` matches ``"model.layers.0"``
+      and ``"model.layers.0.self_attn"`` but NOT ``"model.layers.00"``.
+    - **Glob/wildcard**: entries containing ``*`` or ``?`` are matched
+      with :func:`fnmatch.fnmatch`.  E.g. ``"model.layers.*.self_attn"``
+      matches ``"model.layers.0.self_attn"``, ``"model.layers.1.self_attn"``.
+    """
+    stack = getattr(_module_context, "stack", None)
+    if not stack:
+        return False
+    for entry in reversed(stack):
+        path = entry[3]
+        if path:
+            for pattern in filter_set:
+                if _is_glob(pattern):
+                    if fnmatch.fnmatch(path, pattern):
+                        return True
+                else:
+                    if path == pattern or path.startswith(pattern + "."):
+                        return True
+    return False
+
+
+def parse_layers_env(*env_vars: str) -> Set[str]:
+    """Parse layer path filters from the first non-empty env var.
+
+    Checks each env var in order; returns the first valid set of
+    layer specs after expansion (integers, ranges, globs, full paths).
+    """
+    for var in env_vars:
+        value = os.environ.get(var, "").strip()
+        if value:
+            raw = {t.strip() for t in value.split(",") if t.strip()}
+            return expand_layer_specs(raw)
+    return set()
+
+
+# ── Torch function filtering ──
 
 SKIP_TORCH_FUNCS = frozenset({
     "size", "dim", "is_contiguous", "contiguous", "stride",
@@ -362,6 +579,50 @@ SKIP_TORCH_FUNCS = frozenset({
     "is_complex", "requires_grad_", "data_ptr", "device",
     "dtype", "shape", "ndim", "is_cuda", "is_cpu",
 })
+
+
+def get_torch_func_name(func) -> str:
+    """Extract short name from a torch function."""
+    return getattr(func, "__name__", str(func))
+
+
+def parse_torch_funcs_config(value: str) -> Tuple[bool, Set[str]]:
+    """
+    Parse a torch funcs env var value (e.g. "1", "matmul,softmax").
+
+    Returns:
+        (enabled, func_filter) — func_filter empty means "all"
+    """
+    value = value.strip()
+    if not value or value == "0":
+        return False, set()
+    if value == "1":
+        return True, set()
+    funcs = {t.strip() for t in value.split(",") if t.strip()}
+    return True, funcs
+
+
+def should_inspect_torch_func(
+    func_name: str,
+    torch_funcs_enabled: bool,
+    torch_func_filter: Set[str],
+    match_all: bool,
+    op_filter: Set[str],
+) -> bool:
+    """Check if a torch function should be intercepted."""
+    if not torch_funcs_enabled:
+        return False
+    if torch_func_filter:
+        return func_name in torch_func_filter
+    # "all" mode: skip dunder and trivial ops
+    if func_name.startswith("_"):
+        return False
+    if func_name in SKIP_TORCH_FUNCS:
+        return False
+    # When specific ops are set (not match_all), only match those
+    if op_filter and func_name not in op_filter:
+        return False
+    return True
 
 
 # ── Tensor statistics (shared by inspector and dumper) ──
@@ -458,7 +719,7 @@ def tensor_stats(t: torch.Tensor) -> Dict[str, Any]:
     return meta
 
 
-# ── Common formatting ──
+# ── Formatting ──
 
 
 def format_value(value: Any) -> str:
@@ -509,14 +770,6 @@ def get_module_class_name(args: tuple) -> Optional[str]:
     return None
 
 
-def get_torch_func_name(func) -> str:
-    """Extract short name from a torch function."""
-    return getattr(func, "__name__", str(func))
-
-
-# ── Tag / label helpers (shared by inspector and dumper) ──
-
-
 def make_module_tag() -> str:
     """Build ``[module=X,Y]`` from current module context, or empty string."""
     counter = get_current_module_counter()
@@ -531,7 +784,29 @@ def make_op_tag(op_name: str) -> str:
     return f"[op={idx},{count}]"
 
 
-# ── Shared tag generation for stacked TorchFunctionMode handlers ──
+def make_label(op_name: str, args: tuple = ()) -> str:
+    """Build a display label like ``rms_norm (module=Linear, layer=model.layers.0)``."""
+    module_name = get_module_class_name(args) or get_current_module()
+    path = get_current_module_path()
+    parts = [f"module={module_name or ''}"]
+    if path:
+        parts.append(f"layer={path}")
+    return f"{op_name} ({', '.join(parts)})"
+
+
+def record_seen(op_name: str, args: tuple = ()) -> None:
+    """Record an op and its enclosing module as seen this step (for summary).
+
+    Detects the module name from args[0] (if nn.Module) or the module context.
+    """
+    module_name = get_module_class_name(args) or get_current_module()
+    with _counter_lock:
+        _seen_ops.add(op_name)
+        if module_name:
+            _seen_modules.add(module_name)
+
+
+# ── Torch func tag management ──
 #
 # When both inspector and dumper TorchFunctionMode handlers are active,
 # they are stacked: the outer handler calls func() which enters the inner.
@@ -583,29 +858,7 @@ def release_torch_func_tags() -> None:
         _tf_tags.exec_order = None
 
 
-def make_label(op_name: str, args: tuple = ()) -> str:
-    """Build a display label like ``rms_norm (module=Linear, layer=model.layers.0)``."""
-    module_name = get_module_class_name(args) or get_current_module()
-    path = get_current_module_path()
-    parts = [f"module={module_name or ''}"]
-    if path:
-        parts.append(f"layer={path}")
-    return f"{op_name} ({', '.join(parts)})"
-
-
-def record_seen(op_name: str, args: tuple = ()) -> None:
-    """Record an op and its enclosing module as seen this step (for summary).
-
-    Detects the module name from args[0] (if nn.Module) or the module context.
-    """
-    module_name = get_module_class_name(args) or get_current_module()
-    with _counter_lock:
-        _seen_ops.add(op_name)
-        if module_name:
-            _seen_modules.add(module_name)
-
-
-# ── Global Module Hooks (context tracking only) ──
+# ── Global module hooks (context tracking only) ──
 #
 # Shared by inspector and dumper.  These hooks push/pop the module class
 # name onto a thread-local context stack so op hooks and TorchFunctionMode
@@ -653,319 +906,6 @@ def release_global_module_hooks() -> None:
             for h in _global_hook_handles:
                 h.remove()
             _global_hook_handles.clear()
-
-
-# ── Per-Model Hook Helpers ──
-#
-# Shared by inspector and dumper.  These attach module context hooks
-# (push/pop) to specific named submodules, unlike the global hooks
-# above which intercept every module.  Each caller keeps its own
-# handle list so that inspector and dumper hooks can be removed
-# independently.
-
-
-def attach_per_model_hooks(
-    model: torch.nn.Module,
-    *,
-    enabled: bool,
-    match_all: bool,
-    op_filter: Set[str],
-    module_filter: Set[str],
-) -> List[Any]:
-    """Attach module context hooks to submodules matching the filter.
-
-    Returns a list of hook handles.  The caller should store these
-    in its own ``_hook_handles`` list and use :func:`remove_per_model_hooks`
-    to remove them later.
-    """
-    if not enabled:
-        return []
-    handles: List[Any] = []
-    for name, mod in model.named_modules():
-        if not match_all:
-            cls_name = type(mod).__name__
-            if cls_name not in module_filter and name not in op_filter:
-                continue
-        h1 = mod.register_forward_pre_hook(_per_model_pre_hook)
-        h2 = mod.register_forward_hook(_per_model_post_hook)
-        handles.extend([h1, h2])
-    return handles
-
-
-def remove_per_model_hooks(handles: List[Any]) -> None:
-    """Remove per-model hooks and clear the handle list."""
-    for h in handles:
-        h.remove()
-    handles.clear()
-
-
-def _per_model_pre_hook(module, args):
-    """Push module onto the context stack (per-model hook)."""
-    push_module_context(type(module).__name__, module)
-
-
-def _per_model_post_hook(module, args, output):
-    """Pop module from the context stack (per-model hook)."""
-    pop_module_context()
-
-
-# ── Common parsing ──
-
-
-def parse_torch_funcs_config(value: str) -> Tuple[bool, Set[str]]:
-    """
-    Parse a torch funcs env var value (e.g. "1", "matmul,softmax").
-
-    Returns:
-        (enabled, func_filter) — func_filter empty means "all"
-    """
-    value = value.strip()
-    if not value or value == "0":
-        return False, set()
-    if value == "1":
-        return True, set()
-    funcs = {t.strip() for t in value.split(",") if t.strip()}
-    return True, funcs
-
-
-def parse_step_range_env(*env_vars: str) -> Optional[Tuple[int, int]]:
-    """Parse a step range from the first non-empty env var.
-
-    Checks each env var in order; returns the first valid ``(start, end)``
-    half-open tuple or ``None``.  Accepts ``"start-end"`` inclusive dash
-    format (e.g. ``"0-1"`` → ``(0, 2)``) or a bare integer (e.g. ``"0"``
-    → ``(0, 1)``).
-    """
-    for var in env_vars:
-        value = os.environ.get(var, "").strip()
-        if not value:
-            continue
-        result = parse_step_range(value)
-        if result is not None:
-            return result
-    return None
-
-
-def parse_step_range(value) -> Optional[Tuple[int, int]]:
-    """Parse a step range string into a half-open tuple for internal use.
-
-    Accepted formats (all inclusive):
-    - ``"start-end"``: ``"0-2"`` → ``(0, 3)`` (steps 0, 1, 2)
-    - Bare integer: ``"5"`` → ``(5, 6)`` (step 5 only)
-
-    Returns ``None`` if the value is ``None``, empty, or cannot be parsed.
-    """
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        return None
-    value = value.strip()
-    if not value:
-        return None
-    if "-" in value:
-        parts = value.split("-", 1)
-        try:
-            return (int(parts[0].strip()), int(parts[1].strip()) + 1)
-        except ValueError:
-            return None
-    elif value.isdigit():
-        s = int(value)
-        return (s, s + 1)
-    return None
-
-
-def parse_layers_env(*env_vars: str) -> Set[str]:
-    """Parse layer path filters from the first non-empty env var.
-
-    Checks each env var in order; returns the first valid set of
-    layer specs after expansion (integers, ranges, globs, full paths).
-    """
-    for var in env_vars:
-        value = os.environ.get(var, "").strip()
-        if value:
-            raw = {t.strip() for t in value.split(",") if t.strip()}
-            return expand_layer_specs(raw)
-    return set()
-
-
-def should_inspect_torch_func(
-    func_name: str,
-    torch_funcs_enabled: bool,
-    torch_func_filter: Set[str],
-    match_all: bool,
-    op_filter: Set[str],
-) -> bool:
-    """Check if a torch function should be intercepted."""
-    if not torch_funcs_enabled:
-        return False
-    if torch_func_filter:
-        return func_name in torch_func_filter
-    # "all" mode: skip dunder and trivial ops
-    if func_name.startswith("_"):
-        return False
-    if func_name in SKIP_TORCH_FUNCS:
-        return False
-    # When specific ops are set (not match_all), only match those
-    if op_filter and func_name not in op_filter:
-        return False
-    return True
-
-
-# ── Execution order tracking ──
-
-_exec_order_counter: int = 0
-_exec_order_lock = threading.Lock()
-
-
-def next_exec_order() -> int:
-    """Get the next global execution order number (thread-safe).
-
-    This provides a monotonically increasing counter across all
-    intercepted ops, allowing users to align output with model
-    definition order.
-    """
-    global _exec_order_counter
-    with _exec_order_lock:
-        _exec_order_counter += 1
-        return _exec_order_counter
-
-
-def reset_exec_order() -> None:
-    """Reset the execution order counter (e.g. at step boundaries)."""
-    global _exec_order_counter
-    with _exec_order_lock:
-        _exec_order_counter = 0
-
-
-def get_exec_order() -> int:
-    """Get the current execution order counter value (without incrementing)."""
-    return _exec_order_counter
-
-
-# ── Step tracking (shared by inspector and dumper) ──
-
-_step_counter: int = 0  # first forward pass runs at step 0
-_step_lock = threading.Lock()
-_step_callbacks: List[Any] = []  # called on each step advance
-
-# ── Per-step module and op counters ──
-#
-# module counter: each unique module class name gets a monotonic index (0,1,2,…)
-# and a per-class call count, both reset each step.
-# op counter: same for ops/torch funcs.
-# seen sets: track which modules/ops were encountered this step (for summary).
-
-_module_type_index: Dict[str, int] = {}
-_module_type_count: Dict[str, int] = {}
-_module_next_idx: int = 0
-
-_op_type_index: Dict[str, int] = {}
-_op_type_count: Dict[str, int] = {}
-_op_next_idx: int = 0
-
-_seen_modules: Set[str] = set()
-_seen_ops: Set[str] = set()
-
-_counter_lock = threading.Lock()
-
-
-def next_module_counter(cls_name: str) -> Tuple[int, int]:
-    """Get (type_index, call_count) for a module class this step, incrementing call count."""
-    global _module_next_idx
-    with _counter_lock:
-        if cls_name not in _module_type_index:
-            _module_type_index[cls_name] = _module_next_idx
-            _module_next_idx += 1
-            _module_type_count[cls_name] = 0
-        _module_type_count[cls_name] += 1
-        return _module_type_index[cls_name], _module_type_count[cls_name]
-
-
-def next_op_counter(op_name: str) -> Tuple[int, int]:
-    """Get (type_index, call_count) for an op this step, incrementing call count."""
-    global _op_next_idx
-    with _counter_lock:
-        if op_name not in _op_type_index:
-            _op_type_index[op_name] = _op_next_idx
-            _op_next_idx += 1
-            _op_type_count[op_name] = 0
-        _op_type_count[op_name] += 1
-        return _op_type_index[op_name], _op_type_count[op_name]
-
-
-def _reset_per_step_counters() -> Tuple[Set[str], Set[str]]:
-    """Reset module/op counters and seen sets for a new step.
-
-    Returns:
-        (seen_modules, seen_ops) from the completed step.
-    """
-    global _module_next_idx, _op_next_idx
-    with _counter_lock:
-        seen_modules = _seen_modules.copy()
-        seen_ops = _seen_ops.copy()
-        _seen_modules.clear()
-        _seen_ops.clear()
-        _module_type_index.clear()
-        _module_type_count.clear()
-        _module_next_idx = 0
-        _op_type_index.clear()
-        _op_type_count.clear()
-        _op_next_idx = 0
-    return seen_modules, seen_ops
-
-
-def get_step() -> int:
-    """Get the current step counter value."""
-    return _step_counter
-
-
-def advance_step() -> int:
-    """Increment the step counter and reset execution order (thread-safe).
-
-    Returns the new step number.  Also resets per-step counters and
-    fires registered step callbacks with the summary of the completed step.
-    """
-    global _step_counter
-    with _step_lock:
-        prev_step = _step_counter
-        _step_counter += 1
-        result = _step_counter
-        callbacks = list(_step_callbacks)
-    reset_exec_order()
-    seen_modules, seen_ops = _reset_per_step_counters()
-    for cb in callbacks:
-        try:
-            cb(prev_step, seen_modules, seen_ops)
-        except Exception:
-            _logger.warning("Step callback %s failed", cb.__name__, exc_info=True)
-    return result
-
-
-def reset_step() -> None:
-    """Reset the step counter to 0 (for testing)."""
-    global _step_counter
-    with _step_lock:
-        _step_counter = 0
-    _reset_per_step_counters()
-
-
-def register_step_callback(cb) -> None:
-    """Register a callback to be called on each step advancement.
-
-    Callbacks receive (step, seen_modules, seen_ops) for the completed step.
-    """
-    with _step_lock:
-        if cb not in _step_callbacks:
-            _step_callbacks.append(cb)
-
-
-def unregister_step_callback(cb) -> None:
-    """Remove a previously registered step callback."""
-    with _step_lock:
-        try:
-            _step_callbacks.remove(cb)
-        except ValueError:
-            pass
 
 
 # ── YAML config parsing ──

@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from vllm_fl.dispatch import io_dumper
-from vllm_fl.dispatch._io_common import (
+from vllm_fl.dispatch.io_common import (
     HAS_GLOBAL_MODULE_HOOKS,
     HAS_TORCH_FUNC_MODE,
     advance_step,
@@ -39,7 +39,6 @@ from vllm_fl.dispatch.io_dumper import (
     _serialize_value,
     _should_dump,
     _should_dump_torch_func,
-    attach_dump_hooks,
     disable_io_dump,
     dump_after,
     dump_before,
@@ -47,7 +46,6 @@ from vllm_fl.dispatch.io_dumper import (
     enable_io_dump,
     io_dump_step,
     is_dump_enabled,
-    remove_dump_hooks,
 )
 
 
@@ -196,16 +194,16 @@ class TestShouldDump:
         assert _should_dump("other_op", ())
 
     def test_step_range(self, dump_dir):
-        from vllm_fl.dispatch import _io_common
+        from vllm_fl.dispatch import io_common
 
         enable_io_dump(dump_dir, step_range="5-10")
-        _io_common._step_counter = 3
+        io_common._step_counter = 3
         assert not _should_dump("test_op", ())
-        _io_common._step_counter = 5
+        io_common._step_counter = 5
         assert _should_dump("test_op", ())
-        _io_common._step_counter = 10
+        io_common._step_counter = 10
         assert _should_dump("test_op", ())
-        _io_common._step_counter = 11
+        io_common._step_counter = 11
         assert not _should_dump("test_op", ())
 
 
@@ -461,74 +459,6 @@ class TestEnvVarInit:
         assert not is_dump_enabled()
 
 
-class TestForwardDumpHooks:
-    """Test nn.Module forward hook attachment for dumping."""
-
-    def setup_method(self):
-        reset_step()
-        disable_io_dump()
-
-    def teardown_method(self):
-        disable_io_dump()
-
-    def test_attach_hooks_all(self, dump_dir):
-        enable_io_dump(dump_dir)
-        model = torch.nn.Sequential(
-            torch.nn.Linear(10, 5),
-            torch.nn.ReLU(),
-            torch.nn.Linear(5, 2),
-        )
-        count = attach_dump_hooks(model)
-        assert count >= 4  # Sequential + 3 children
-        remove_dump_hooks()
-
-    def test_attach_hooks_by_module_filter(self, dump_dir):
-        enable_io_dump(dump_dir, modules={"Linear"})
-        model = torch.nn.Sequential(
-            torch.nn.Linear(10, 5),
-            torch.nn.ReLU(),
-            torch.nn.Linear(5, 2),
-        )
-        count = attach_dump_hooks(model)
-        assert count == 2  # Only the two Linear modules
-        remove_dump_hooks()
-
-    def test_hooks_create_dump_files(self, dump_dir):
-        enable_io_dump(dump_dir, modules={"Linear"}, meta_only=False)
-        model = torch.nn.Linear(4, 3)
-        attach_dump_hooks(model)
-
-        x = torch.randn(2, 4)
-        model(x)
-
-        # Step stays at 0 (step is advanced by model_runner.execute_model)
-        step_dir = os.path.join(dump_dir, "rank_0000", "step_0000")
-        assert os.path.isdir(step_dir)
-        # The label should be "Linear." (root module has empty name)
-        # Find any .pt files
-        found_pt = False
-        for root, dirs, files in os.walk(step_dir):
-            for f in files:
-                if f.endswith(".pt"):
-                    found_pt = True
-        assert found_pt
-        remove_dump_hooks()
-
-    def test_attach_disabled_returns_zero(self):
-        model = torch.nn.Linear(4, 3)
-        count = attach_dump_hooks(model)
-        assert count == 0
-
-    def test_disable_removes_hooks(self, dump_dir):
-        enable_io_dump(dump_dir)
-        model = torch.nn.Linear(4, 3)
-        attach_dump_hooks(model)
-        disable_io_dump()
-        from vllm_fl.dispatch.io_dumper import _hook_handles
-
-        assert len(_hook_handles) == 0
-
-
 class TestParseTorchFuncsConfig:
     """Test parse_torch_funcs_config parsing logic."""
 
@@ -610,7 +540,7 @@ class TestGlobalModuleHooks:
         reason="Global module hooks not available in this PyTorch version",
     )
     def test_global_hooks_create_files_without_attach(self, dump_dir):
-        """Global hooks should dump files without calling attach_dump_hooks()."""
+        """Global hooks should dump files when dump is enabled."""
         enable_io_dump(dump_dir, modules={"Linear"}, meta_only=False)
         model = torch.nn.Linear(4, 3)
 
@@ -1568,7 +1498,7 @@ class TestTensorStats:
     """Test tensor_stats() and register_tensor_stat() extensibility."""
 
     def test_basic_stats(self):
-        from vllm_fl.dispatch._io_common import tensor_stats
+        from vllm_fl.dispatch.io_common import tensor_stats
 
         t = torch.tensor([1.0, 2.0, 3.0, 4.0])
         s = tensor_stats(t)
@@ -1579,7 +1509,7 @@ class TestTensorStats:
         assert abs(s["mean"] - 2.5) < 1e-5
 
     def test_integer_tensor_skips_float_only(self):
-        from vllm_fl.dispatch._io_common import tensor_stats
+        from vllm_fl.dispatch.io_common import tensor_stats
 
         t = torch.tensor([1, 2, 3])
         s = tensor_stats(t)
@@ -1591,7 +1521,7 @@ class TestTensorStats:
         assert "std" not in s
 
     def test_empty_tensor(self):
-        from vllm_fl.dispatch._io_common import tensor_stats
+        from vllm_fl.dispatch.io_common import tensor_stats
 
         t = torch.zeros(0)
         s = tensor_stats(t)
@@ -1600,7 +1530,7 @@ class TestTensorStats:
         assert "min" not in s
 
     def test_register_custom_stat(self):
-        from vllm_fl.dispatch._io_common import (
+        from vllm_fl.dispatch.io_common import (
             _TENSOR_STAT_REGISTRY,
             register_tensor_stat,
             tensor_stats,
@@ -1619,7 +1549,7 @@ class TestTensorStats:
                 _TENSOR_STAT_REGISTRY.pop()
 
     def test_register_non_float_stat(self):
-        from vllm_fl.dispatch._io_common import (
+        from vllm_fl.dispatch.io_common import (
             _TENSOR_STAT_REGISTRY,
             register_tensor_stat,
             tensor_stats,

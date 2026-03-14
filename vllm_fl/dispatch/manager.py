@@ -27,7 +27,7 @@ from .io_dumper import (
     dump_cleanup,
     is_dump_enabled,
 )
-from ._io_common import make_module_tag, make_op_tag, next_exec_order
+from .io_common import make_module_tag, make_op_tag, next_exec_order
 
 
 logger = logging.getLogger(__name__)
