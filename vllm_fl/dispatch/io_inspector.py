@@ -104,6 +104,7 @@ from .io_common import (
     release_torch_func_tags,
     should_inspect_torch_func,
     unregister_step_callback,
+    warn_if_not_eager,
 )
 from .logger_manager import get_logger
 
@@ -438,6 +439,7 @@ def enable_io_inspect(
         f"layers={_layer_filter or 'all'}, "
         f"torch_funcs={_torch_funcs_enabled}, step_range={_step_range}"
     )
+    warn_if_not_eager("IO_INSPECT")
 
 
 def disable_io_inspect() -> None:

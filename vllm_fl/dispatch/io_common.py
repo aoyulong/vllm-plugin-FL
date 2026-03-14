@@ -39,6 +39,46 @@ try:
 except ImportError:
     HAS_GLOBAL_MODULE_HOOKS = False
 
+
+def _is_eager_mode() -> bool:
+    """Best-effort check for whether eager mode (no torch.compile) is active.
+
+    Returns True if we're confident the model is running in eager mode,
+    False if torch.compile / torch._dynamo appears active or detection fails.
+    """
+    try:
+        import torch._dynamo as dynamo
+        # If cudagraphs or other compile backends are configured, not eager
+        if getattr(dynamo.config, "suppress_errors", False):
+            return False
+        # Check if any compiled frames exist (indicates torch.compile was used)
+        if hasattr(dynamo, "is_compiling") and dynamo.is_compiling():
+            return False
+    except (ImportError, AttributeError):
+        pass
+    # Fall back to checking the VLLM-specific env var / config hint
+    vllm_enforce = os.environ.get("VLLM_TORCH_COMPILE_LEVEL", "")
+    if vllm_enforce and vllm_enforce != "0":
+        return False
+    return True
+
+
+def warn_if_not_eager(subsystem: str) -> None:
+    """Log a hint if the model doesn't appear to be running in eager mode.
+
+    Called once when the inspector or dumper is enabled so users know
+    they can get more comprehensive interception with ``enforce_eager=True``.
+    """
+    if not _is_eager_mode():
+        _logger.warning(
+            "[%s] torch.compile detected. Use enforce_eager=True "
+            "for more comprehensive IO interception (torch function "
+            "tracing and global module hooks may be partially bypassed "
+            "by compiled regions).",
+            subsystem,
+        )
+
+
 # ── Distributed rank ──
 
 _rank: Optional[int] = None  # cached after first call

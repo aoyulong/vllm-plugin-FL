@@ -111,6 +111,7 @@ from .io_common import (
     should_inspect_torch_func,
     tensor_stats,
     unregister_step_callback,
+    warn_if_not_eager,
 )
 from .logger_manager import get_logger
 
@@ -646,6 +647,7 @@ def enable_io_dump(
         f"max_calls={_max_calls}, step_range={_step_range}, "
         f"torch_funcs={_torch_funcs_enabled}, meta_only={_meta_only}"
     )
+    warn_if_not_eager("IO_DUMP")
 
 
 def disable_io_dump() -> None:
