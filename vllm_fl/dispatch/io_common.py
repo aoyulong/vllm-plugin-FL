@@ -665,7 +665,10 @@ def register_tensor_stat(
 ) -> None:
     """Register a custom tensor statistic for both inspector and dumper.
 
-    The function receives a tensor and should return a JSON-serializable scalar.
+    The function receives a tensor and should return a JSON-serializable
+    value — scalar, list, or dict.  Scalars are displayed inline;
+    lists are shown truncated (e.g. ``top_k=[1.2, 0.8, ...]``).
+
     For ``float_only=True`` (default), the tensor is ``t.detach().float()``;
     for ``float_only=False``, the original tensor is passed.
 
@@ -675,9 +678,17 @@ def register_tensor_stat(
     Example::
 
         from vllm_fl.dispatch import register_tensor_stat
+        # Scalar stats
         register_tensor_stat("l2_norm", lambda t: t.norm(2).item())
         register_tensor_stat("sparsity",
                              lambda t: (t == 0).float().mean().item())
+        # List stats (for future top-k, first-n, last-n, etc.)
+        register_tensor_stat("top_5",
+                             lambda t: t.flatten().topk(5).values.tolist(),
+                             float_only=False)
+        register_tensor_stat("first_4",
+                             lambda t: t.flatten()[:4].tolist(),
+                             float_only=False)
     """
     if not name or not name.strip():
         raise ValueError("Tensor stat name must be a non-empty string")
@@ -721,6 +732,25 @@ def tensor_stats(t: torch.Tensor) -> Dict[str, Any]:
 
 # ── Formatting ──
 
+_STAT_LIST_DISPLAY_LIMIT = 4  # max items shown inline for list-valued stats
+
+
+def _format_stat_value(v: Any) -> str:
+    """Format a stat value for inline display.
+
+    Scalars: ``0.123456``.  Lists: ``[1.2, 0.8, ...]`` (truncated).
+    """
+    if isinstance(v, float):
+        return f"{v:.6g}"
+    if isinstance(v, (list, tuple)):
+        limit = _STAT_LIST_DISPLAY_LIMIT
+        formatted = [f"{x:.6g}" if isinstance(x, float) else repr(x)
+                     for x in v[:limit]]
+        if len(v) > limit:
+            formatted.append("...")
+        return f"[{', '.join(formatted)}]"
+    return repr(v)
+
 
 def format_value(value: Any) -> str:
     """Format a single value for display, including tensor statistics."""
@@ -734,9 +764,7 @@ def format_value(value: Any) -> str:
         for name, _, _ in _TENSOR_STAT_REGISTRY:
             if name in stats:
                 v = stats[name]
-                parts.append(
-                    f"{name}={v:.6g}" if isinstance(v, float) else f"{name}={v}"
-                )
+                parts.append(f"{name}={_format_stat_value(v)}")
         return f"Tensor({', '.join(parts)})"
     if value is None:
         return "None"
