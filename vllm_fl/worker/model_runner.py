@@ -3726,14 +3726,18 @@ class ModelRunnerFL(
             time_after_load - time_before_load,
             scope="local",
         )
+
         # Always register module paths — cheap (one pass over named_modules)
         # and required by all three IO configuration methods (env vars, YAML,
         # and the Python API) for layer-path filtering to work.
-        from vllm_fl.dispatch.io_common import register_module_paths
+        from vllm_fl.dispatch.io_common import register_module_paths, set_eager_mode
         register_module_paths(self.model)
-        # Import io_inspector/io_dumper to trigger _init_from_env() only when
-        # configured via env vars or YAML config.  Python API users import
-        # these modules themselves when calling enable_io_inspect/enable_io_dump.
+        # Tell the IO system whether torch.compile will be used so it can
+        # skip global module hooks that interfere with AOT autograd.
+        set_eager_mode(getattr(self.model_config, "enforce_eager", False))
+        # Initialize IO inspector/dumper from env vars or YAML config.
+        # This must happen AFTER set_eager_mode() so _activate_hooks() knows
+        # whether to register global module hooks (incompatible with torch.compile).
         _io_env_prefixes = ("VLLM_FL_IO_INSPECT", "VLLM_FL_IO_DUMP",
                             "VLLM_FL_IO_STEP_RANGE", "VLLM_FL_IO_LAYERS",
                             "VLLM_FL_IO_RANK")
@@ -3741,8 +3745,11 @@ class ModelRunnerFL(
             k.startswith(_io_env_prefixes) for k in os.environ
         ) or os.environ.get("VLLM_FL_CONFIG", "").strip()
         if _io_requested:
-            import vllm_fl.dispatch.io_inspector  # noqa: F401
-            import vllm_fl.dispatch.io_dumper  # noqa: F401
+            from vllm_fl.dispatch.io_inspector import _init_from_env as _init_inspect
+            from vllm_fl.dispatch.io_dumper import _init_from_env as _init_dump
+            _init_inspect()
+            _init_dump()
+
         prepare_communication_buffer_for_model(self.model)
         if (drafter := getattr(self, "drafter", None)) and (
             drafter_model := getattr(drafter, "model", None)

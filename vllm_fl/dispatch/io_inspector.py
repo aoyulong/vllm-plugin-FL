@@ -105,6 +105,7 @@ from .io_common import (
     should_inspect_torch_func,
     unregister_step_callback,
     warn_if_not_eager,
+    _is_eager_mode,
 )
 from .logger_manager import get_logger
 
@@ -429,7 +430,7 @@ def enable_io_inspect(
     _activate_hooks()
 
     # Propagate to env vars so child processes (e.g. vLLM EngineCore workers)
-    # pick up the config via _init_from_env() on module import.
+    # pick up the config via _init_from_env() in model_runner.
     _set_env_vars(ops, modules, _layer_filter, torch_funcs, ranks, _step_range)
 
     logger.info(
@@ -561,6 +562,19 @@ def _on_step_summary(step: int, seen_modules: Set[str], seen_ops: Set[str]) -> N
 def _activate_hooks():
     """Register global module hooks and/or TorchFunctionMode as needed."""
     global _torch_func_mode_instance, _owns_global_hooks
+
+    eager = _is_eager_mode()
+
+    if not eager:
+        logger.warning(
+            "[IO_INSPECT] torch.compile detected — IO inspection is disabled. "
+            "Compiled graphs bypass Python dispatch, so per-op hooks cannot "
+            "fire. Use enforce_eager=True to enable IO inspection."
+        )
+        # Skip all hook registration: global module hooks interfere with
+        # AOT autograd, and TorchFunctionMode is also incompatible.
+        register_step_callback(_on_step_summary)
+        return
 
     # Register global module hooks to track module context.
     # In match-all mode, this provides module annotations on op/torch_func
@@ -722,6 +736,3 @@ def _init_from_env() -> None:
             f"layers={_layer_filter or 'all'}, "
             f"torch_funcs={_torch_funcs_enabled}, step_range={_step_range}"
         )
-
-
-_init_from_env()

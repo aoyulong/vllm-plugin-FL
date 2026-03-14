@@ -40,22 +40,28 @@ except ImportError:
     HAS_GLOBAL_MODULE_HOOKS = False
 
 
-def _is_eager_mode() -> bool:
-    """Best-effort check for whether eager mode (no torch.compile) is active.
+_eager_mode_override: Optional[bool] = None
 
-    Returns True if we're confident the model is running in eager mode,
-    False if torch.compile / torch._dynamo appears active or detection fails.
+
+def set_eager_mode(eager: bool) -> None:
+    """Explicitly set whether the model is running in eager mode.
+
+    Called by model_runner with the actual ``enforce_eager`` config value so
+    that IO hooks know whether torch.compile will be used *before* compilation
+    starts (runtime detection is unreliable at hook-registration time).
     """
-    try:
-        import torch._dynamo as dynamo
-        # If cudagraphs or other compile backends are configured, not eager
-        if getattr(dynamo.config, "suppress_errors", False):
-            return False
-        # Check if any compiled frames exist (indicates torch.compile was used)
-        if hasattr(dynamo, "is_compiling") and dynamo.is_compiling():
-            return False
-    except (ImportError, AttributeError):
-        pass
+    global _eager_mode_override
+    _eager_mode_override = eager
+
+
+def _is_eager_mode() -> bool:
+    """Check whether eager mode (no torch.compile) is active.
+
+    If ``set_eager_mode()`` was called (by model_runner), use that value.
+    Otherwise fall back to best-effort runtime detection.
+    """
+    if _eager_mode_override is not None:
+        return _eager_mode_override
     # Fall back to checking the VLLM-specific env var / config hint
     vllm_enforce = os.environ.get("VLLM_TORCH_COMPILE_LEVEL", "")
     if vllm_enforce and vllm_enforce != "0":

@@ -112,6 +112,7 @@ from .io_common import (
     tensor_stats,
     unregister_step_callback,
     warn_if_not_eager,
+    _is_eager_mode,
 )
 from .logger_manager import get_logger
 
@@ -635,7 +636,7 @@ def enable_io_dump(
     _activate_hooks()
 
     # Propagate to env vars so child processes (e.g. vLLM EngineCore workers)
-    # pick up the config via _init_from_env() on module import.
+    # pick up the config via _init_from_env() in model_runner.
     _set_env_vars(_dump_dir, ops, modules, _layer_filter, max_calls, _step_range,
                   torch_funcs, ranks, _meta_only)
 
@@ -779,6 +780,19 @@ if HAS_TORCH_FUNC_MODE:
 def _activate_hooks():
     """Register global module hooks and/or TorchFunctionMode as needed."""
     global _torch_func_mode_instance, _owns_global_hooks
+
+    eager = _is_eager_mode()
+
+    if not eager:
+        logger.warning(
+            "[IO_DUMP] torch.compile detected — IO dumping is disabled. "
+            "Compiled graphs bypass Python dispatch, so per-op hooks cannot "
+            "fire. Use enforce_eager=True to enable IO dumping."
+        )
+        # Skip all hook registration: global module hooks interfere with
+        # AOT autograd, and TorchFunctionMode is also incompatible.
+        register_step_callback(_on_step_advance)
+        return
 
     # Register global module hooks to track module context.
     # In match-all mode, this provides module annotations on dump file
@@ -995,6 +1009,3 @@ def _init_from_env() -> None:
         f"max_calls={_max_calls}, step_range={_step_range}, "
         f"torch_funcs={_torch_funcs_enabled}, meta_only={_meta_only}"
     )
-
-
-_init_from_env()
