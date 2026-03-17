@@ -10,13 +10,20 @@ Only logs at the **op level** (dispatch-managed ops and bare torch functions).
 Module-level logging is not produced; instead, module names are appended
 to op log entries so users can see which module invoked each op.
 
-When a ``modules`` filter is set (e.g., ``modules={"RMSNormFL"}``), global
-module hooks track which module is executing.  Only ops and torch functions
-that run inside the specified modules are logged.
+When a ``modules`` filter is set (e.g., ``modules={"RMSNormFL"}``), module
+context is derived from the Python call stack.  Only ops that run inside
+the specified modules are logged.
 
-Supports two interception mechanisms:
+Supports three interception mechanisms:
 1. Dispatch-managed ops: Automatic via OpManager.call() hooks
-2. Bare torch functions: Via TorchFunctionMode (opt-in)
+2. ATen-level ops: Via TorchDispatchMode (default, works in both eager and compile modes)
+3. Bare torch functions: Via TorchFunctionMode (opt-in, eager mode only)
+
+When initialized via environment variables (``_init_from_env``), config is parsed
+during ``load_model()`` but dispatch mode activation is deferred until
+``maybe_activate_hooks()`` is called from ``execute_model()``.  This prevents
+the dispatch mode from interfering with vLLM's ``determine_available_memory()``
+phase.  The programmatic API (``enable_io_inspect()``) activates hooks immediately.
 
 Configuration (priority order):
     1. Python API: enable_io_inspect(ops=..., step_range=..., layers=...)
@@ -69,28 +76,35 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import Any, List, Optional, Set, Tuple
+from typing import Any, List, Optional, Set, Tuple, Union
 
 import torch
 
 from .io_common import (
+    HAS_TORCH_DISPATCH_MODE,
     HAS_TORCH_FUNC_MODE,
+    TorchDispatchMode,
     TorchFunctionMode,
-    acquire_global_module_hooks,
     acquire_torch_func_tags,
     expand_layer_specs,
     format_result,
     format_value,
+    get_dispatch_keys,
+    get_dispatch_op_name,
+    get_dispatch_op_namespace,
     get_module_class_name,
+    get_module_context_from_stack,
     get_rank,
     get_step,
     get_torch_func_name,
     layer_path_matches,
+    layer_path_matches_from_stack,
     make_guard,
     make_label,
     make_module_tag,
     make_op_tag,
     module_context_matches,
+    module_context_matches_from_stack,
     next_exec_order,
     parse_io_config_from_yaml,
     parse_layers_env,
@@ -100,8 +114,8 @@ from .io_common import (
     parse_torch_funcs_config,
     record_seen,
     register_step_callback,
-    release_global_module_hooks,
     release_torch_func_tags,
+    should_inspect_dispatch_op,
     should_inspect_torch_func,
     unregister_step_callback,
     warn_if_not_eager,
@@ -110,6 +124,9 @@ from .io_common import (
 from .logger_manager import get_logger
 
 logger = get_logger("vllm_fl.dispatch.io_inspect")
+
+# Sentinel for "not set by caller — inherit from env/YAML"
+_UNSET = object()
 
 # ── Module-level state ──
 
@@ -136,7 +153,8 @@ def _rank_ok() -> bool:
 
 # Hook handles
 _torch_func_mode_instance: Optional[Any] = None
-_owns_global_hooks: bool = False       # Whether we acquired global module hooks
+_dispatch_mode_instance: Optional[Any] = None
+_hooks_activated: bool = False  # True once dispatch/func modes have been entered
 
 # Thread-local storage for pairing inspect_before → inspect_after
 _inspect_pairing = threading.local()
@@ -172,17 +190,26 @@ def _should_inspect(op_name: str, args: tuple) -> bool:
     return bool(_op_filter) or bool(_module_filter)
 
 
-def _should_inspect_torch_func(func_name: str) -> bool:
+def _should_inspect_torch_func(func_name: str, module_ctx=None) -> bool:
     """Check if a torch function should be inspected.
 
     Layer and module filters are AND gates (same as ``_should_inspect``).
+
+    Args:
+        func_name: Torch function name.
+        module_ctx: Stack-derived module context (from ``get_module_context_from_stack``).
+            If provided, used for layer/module filtering instead of global hook context.
     """
     if _step_range is not None:
         step = get_step()
         if step < _step_range[0] or step >= _step_range[1]:
             return False
-    if _layer_filter and not layer_path_matches(_layer_filter):
-        return False
+    if _layer_filter:
+        if module_ctx is not None:
+            if not layer_path_matches_from_stack(_layer_filter, module_ctx):
+                return False
+        elif not layer_path_matches(_layer_filter):
+            return False
     if not should_inspect_torch_func(
         func_name, _torch_funcs_enabled, _torch_func_filter,
         _match_all, _op_filter,
@@ -190,6 +217,8 @@ def _should_inspect_torch_func(func_name: str) -> bool:
         return False
     # When module filter is active, only match torch funcs inside those modules
     if _module_filter and not _match_all:
+        if module_ctx is not None:
+            return module_context_matches_from_stack(_module_filter, module_ctx)
         return module_context_matches(_module_filter)
     return True
 
@@ -362,11 +391,11 @@ def inspect_cleanup(op_name: str) -> None:
 
 
 def enable_io_inspect(
-    ops: Optional[Set[str]] = None,
-    modules: Optional[Set[str]] = None,
-    layers=None,
-    torch_funcs: bool = True,
-    ranks: Optional[Set[int]] = None,
+    ops: Union[Optional[Set[str]], object] = _UNSET,
+    modules: Union[Optional[Set[str]], object] = _UNSET,
+    layers=_UNSET,
+    torch_funcs: Optional[bool] = None,
+    ranks: Union[Optional[Set[int]], object] = _UNSET,
     step_range: Optional[str] = None,
 ) -> None:
     """
@@ -375,36 +404,73 @@ def enable_io_inspect(
     All filter dimensions are composable (AND logic): when multiple
     filters are set, an op must satisfy ALL of them to be logged.
 
+    Config sources are merged with priority: API > YAML > env.
+    Fields not explicitly set via the API fall through to env vars / YAML.
+
+    By default, uses TorchDispatchMode which intercepts ops at the ATen
+    dispatcher level and works in both eager and compiled modes.
+
     Args:
-        ops: Dispatch-managed op names to inspect. None = all.
+        ops: Dispatch-managed op names to inspect. ``None`` = all ops.
+            Unset = inherit from env var ``VLLM_FL_IO_INSPECT``.
         modules: nn.Module class names to scope inspection to.
-            When set, only ops/torch_funcs executing inside these modules
-            are logged.  None = no module scoping (inspect everywhere).
+            ``None`` = no module scoping (inspect everywhere).
+            Unset = inherit from env var ``VLLM_FL_IO_INSPECT``.
         layers: Layer specifications to scope inspection to.  Supports
             integer shorthand (``"0"`` → ``"model.layers.0"``),
             ranges (``"0-3"``), glob patterns (``"model.layers.*.self_attn"``),
-            and full paths.  None = no layer scoping.
-        torch_funcs: Intercept bare torch functional ops. Default True
-            (all intercepted). Set False to skip torch functions.
-        ranks: Set of ranks to inspect on. None = all ranks.
+            and full paths.  ``None`` = no layer scoping.
+            Unset = inherit from env var.
+        torch_funcs: Also intercept bare torch functional ops via
+            TorchFunctionMode (eager mode only).  Default ``None`` (inherit
+            from env var ``VLLM_FL_IO_INSPECT_TORCH_FUNCS``).
+            Set ``True``/``False`` to explicitly enable/disable.
+        ranks: Set of ranks to inspect on. ``None`` = all ranks.
+            Unset = inherit from env var ``VLLM_FL_IO_INSPECT_RANK``.
         step_range: Inclusive step range string.  ``"0-2"`` means
             steps 0, 1, 2.  A bare integer ``"5"`` means step 5 only.
-            None = all steps.
+            ``None`` = inherit from env var.
     """
     global _enabled, _match_all, _op_filter, _module_filter, _layer_filter
     global _torch_funcs_enabled, _torch_func_filter, _step_range, _rank_filter
 
-    if ops is None and modules is None:
-        _match_all = True
-        _op_filter = set()
-        _module_filter = set()
+    # ── ops / modules: API > env fallback ──
+    if ops is _UNSET and modules is _UNSET:
+        # Neither set via API — try env var
+        env_val = os.environ.get("VLLM_FL_IO_INSPECT", "").strip()
+        if env_val and env_val != "0":
+            _match_all, _op_filter, _module_filter = _parse_config(env_val)
+        else:
+            _match_all = True
+            _op_filter = set()
+            _module_filter = set()
+    elif ops is _UNSET or modules is _UNSET:
+        # One set, one not — resolve the unset one from env, then merge
+        env_val = os.environ.get("VLLM_FL_IO_INSPECT", "").strip()
+        _, env_ops, env_modules = _parse_config(env_val) if (env_val and env_val != "0") else (True, set(), set())
+        resolved_ops = env_ops if ops is _UNSET else (set(ops) if ops else set())
+        resolved_modules = env_modules if modules is _UNSET else (set(modules) if modules else set())
+        if not resolved_ops and not resolved_modules:
+            _match_all = True
+            _op_filter = set()
+            _module_filter = set()
+        else:
+            _match_all = False
+            _op_filter = resolved_ops
+            _module_filter = resolved_modules
     else:
-        _match_all = False
-        _op_filter = set(ops) if ops else set()
-        _module_filter = set(modules) if modules else set()
+        # Both explicitly set via API
+        if ops is None and modules is None:
+            _match_all = True
+            _op_filter = set()
+            _module_filter = set()
+        else:
+            _match_all = False
+            _op_filter = set(ops) if ops else set()
+            _module_filter = set(modules) if modules else set()
 
-    # If no layers given explicitly, check env vars (already expanded)
-    if layers is None:
+    # ── layers: API > env fallback ──
+    if layers is _UNSET or layers is None:
         layers = parse_layers_env(
             "VLLM_FL_IO_INSPECT_LAYERS", "VLLM_FL_IO_LAYERS"
         )
@@ -414,10 +480,19 @@ def enable_io_inspect(
         layers = expand_layer_specs(layers)
     _layer_filter = set(layers) if layers else set()
 
-    _torch_funcs_enabled = torch_funcs
-    _torch_func_filter = set()
-    # Parse step_range: accepts string "0-2" or None.
-    # parse_step_range handles inclusive→half-open conversion.
+    # ── torch_funcs: API > env fallback ──
+    if torch_funcs is not None:
+        _torch_funcs_enabled = torch_funcs
+        _torch_func_filter = set()
+    else:
+        tf_val = os.environ.get("VLLM_FL_IO_INSPECT_TORCH_FUNCS", "")
+        if tf_val:
+            _torch_funcs_enabled, _torch_func_filter = parse_torch_funcs_config(tf_val)
+        else:
+            _torch_funcs_enabled = False
+            _torch_func_filter = set()
+
+    # ── step_range: API > env fallback ──
     if step_range is not None:
         _step_range = parse_step_range(step_range)
     else:
@@ -426,16 +501,27 @@ def enable_io_inspect(
         )
     _enabled = True
 
-    _rank_filter = ranks
+    # ── ranks: API > env fallback ──
+    if ranks is not _UNSET:
+        _rank_filter = ranks
+    else:
+        rank_env = os.environ.get("VLLM_FL_IO_INSPECT_RANK", "") or os.environ.get("VLLM_FL_IO_RANK", "")
+        if rank_env:
+            _rank_filter = parse_rank_filter(rank_env)
+        else:
+            _rank_filter = None
     _activate_hooks()
 
-    # Propagate to env vars so child processes (e.g. vLLM EngineCore workers)
-    # pick up the config via _init_from_env() in model_runner.
-    _set_env_vars(ops, modules, _layer_filter, torch_funcs, ranks, _step_range)
+    # Propagate resolved config to env vars so child processes
+    # (e.g. vLLM EngineCore workers) inherit via _init_from_env().
+    _resolved_ops = _op_filter if not _match_all else None
+    _resolved_modules = _module_filter if not _match_all else None
+    _set_env_vars(_resolved_ops, _resolved_modules, _layer_filter,
+                  _torch_funcs_enabled, _rank_filter, _step_range)
 
     logger.info(
         f"IO Inspect enabled: rank={get_rank()}, "
-        f"rank_filter={ranks or 'all'}, "
+        f"rank_filter={_rank_filter or 'all'}, "
         f"ops={_op_filter or 'all'}, modules={_module_filter or 'all'}, "
         f"layers={_layer_filter or 'all'}, "
         f"torch_funcs={_torch_funcs_enabled}, step_range={_step_range}"
@@ -461,7 +547,7 @@ def _set_env_vars(
     ranks: Optional[Set[int]],
     step_range: Optional[Tuple[int, int]],
 ) -> None:
-    """Set VLLM_FL_IO_INSPECT* env vars so child processes inherit the config."""
+    """Set VLLM_FL_IO_INSPECT* env vars so child processes inherit the resolved config."""
     if ops is None and modules is None:
         os.environ["VLLM_FL_IO_INSPECT"] = "1"
     else:
@@ -472,8 +558,6 @@ def _set_env_vars(
             tokens.extend(f"module:{m}" for m in sorted(modules))
         os.environ["VLLM_FL_IO_INSPECT"] = ",".join(tokens) if tokens else "1"
 
-    # Always set explicitly so child processes don't fall back to
-    # the match-all default when torch_funcs was disabled.
     os.environ["VLLM_FL_IO_INSPECT_TORCH_FUNCS"] = "1" if torch_funcs else "0"
 
     if ranks is not None:
@@ -501,6 +585,73 @@ def _clear_env_vars() -> None:
     os.environ.pop("VLLM_FL_IO_INSPECT_LAYERS", None)
 
 
+# ── TorchDispatchMode (default — works in both eager and compile modes) ──
+
+
+if HAS_TORCH_DISPATCH_MODE:
+    class _InspectDispatchMode(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            if not _enabled or guard_active() or not _rank_ok():
+                return func(*args, **kwargs)
+
+            op_name = get_dispatch_op_name(func)
+            if not should_inspect_dispatch_op(op_name, _match_all, _op_filter):
+                return func(*args, **kwargs)
+
+            # Step range check
+            if _step_range is not None:
+                step = get_step()
+                if step < _step_range[0] or step >= _step_range[1]:
+                    return func(*args, **kwargs)
+
+            # Derive module context from call stack (works in compile mode)
+            module_ctx = get_module_context_from_stack()
+
+            # Layer filter check
+            if _layer_filter and not layer_path_matches_from_stack(
+                _layer_filter, module_ctx
+            ):
+                return func(*args, **kwargs)
+
+            # Module filter check
+            if _module_filter and not _match_all:
+                if not module_context_matches_from_stack(
+                    _module_filter, module_ctx
+                ):
+                    return func(*args, **kwargs)
+
+            ns = get_dispatch_op_namespace(func)
+            full_name = f"{ns}.{op_name}"
+            dispatch_keys = get_dispatch_keys(func, args, kwargs)
+            # Extract module name and layer path from stack context
+            mod_name = module_ctx[0][0] if module_ctx else ""
+            mod_path = module_ctx[0][1] if module_ctx else ""
+            label = make_label(full_name, module_name=mod_name or None,
+                               layer_path=mod_path or None,
+                               dispatch_keys=dispatch_keys)
+            order = next_exec_order()
+            op_tag = make_op_tag(full_name)
+            record_seen(full_name, module_name=mod_name or None)
+
+            set_guard(True)
+            try:
+                input_lines = _format_inputs(args, kwargs)
+            finally:
+                set_guard(False)
+
+            result = func(*args, **kwargs)
+
+            set_guard(True)
+            try:
+                _log_combined(label, input_lines, result,
+                              op_tag=op_tag, exec_order=order)
+            finally:
+                set_guard(False)
+
+            return result
+
+
 # ── TorchFunctionMode (opt-in for bare torch ops) ──
 
 
@@ -512,14 +663,18 @@ if HAS_TORCH_FUNC_MODE:
                 return func(*args, **kwargs)
 
             func_name = get_torch_func_name(func)
-            if not _should_inspect_torch_func(func_name):
+            module_ctx = get_module_context_from_stack()
+            if not _should_inspect_torch_func(func_name, module_ctx):
                 return func(*args, **kwargs)
 
             # Include enclosing module context in label
             full_name = f"torch.{func_name}"
-            label = make_label(full_name)
-            module_tag, op_tag, order = acquire_torch_func_tags(full_name)
-            record_seen(full_name)
+            mod_name = module_ctx[0][0] if module_ctx else ""
+            mod_path = module_ctx[0][1] if module_ctx else ""
+            label = make_label(full_name, module_name=mod_name or None,
+                               layer_path=mod_path or None)
+            _mt, op_tag, order = acquire_torch_func_tags(full_name)
+            record_seen(full_name, module_name=mod_name or None)
             set_guard(True)
             try:
                 input_lines = _format_inputs(args, kwargs)
@@ -534,8 +689,7 @@ if HAS_TORCH_FUNC_MODE:
             set_guard(True)
             try:
                 _log_combined(label, input_lines, result,
-                              module_tag=module_tag, op_tag=op_tag,
-                              exec_order=order)
+                              op_tag=op_tag, exec_order=order)
             finally:
                 set_guard(False)
 
@@ -560,52 +714,51 @@ def _on_step_summary(step: int, seen_modules: Set[str], seen_ops: Set[str]) -> N
 
 
 def _activate_hooks():
-    """Register global module hooks and/or TorchFunctionMode as needed."""
-    global _torch_func_mode_instance, _owns_global_hooks
+    """Register TorchDispatchMode (default) and optionally TorchFunctionMode."""
+    global _torch_func_mode_instance, _dispatch_mode_instance, _hooks_activated
 
+    # TorchDispatchMode is the default — works in both eager and compile modes.
+    if HAS_TORCH_DISPATCH_MODE and _dispatch_mode_instance is None:
+        _dispatch_mode_instance = _InspectDispatchMode()
+        _dispatch_mode_instance.__enter__()
+
+    # TorchFunctionMode is opt-in (torch_funcs=True) and eager-mode only.
     eager = _is_eager_mode()
-
-    if not eager:
-        logger.warning(
-            "[IO_INSPECT] torch.compile detected — IO inspection is disabled. "
-            "Compiled graphs bypass Python dispatch, so per-op hooks cannot "
-            "fire. Use enforce_eager=True to enable IO inspection."
-        )
-        # Skip all hook registration: global module hooks interfere with
-        # AOT autograd, and TorchFunctionMode is also incompatible.
-        register_step_callback(_on_step_summary)
-        return
-
-    # Register global module hooks to track module context.
-    # In match-all mode, this provides module annotations on op/torch_func
-    # log entries (e.g. "Op 'rms_norm' (module=RMSNormFL)").
-    # When module filter or layer filter is set, this also enables
-    # scope-based filtering (layer filter needs paths from the hook).
-    needs_module_hooks = _match_all or bool(_module_filter) or bool(_layer_filter)
-    if needs_module_hooks and not _owns_global_hooks:
-        acquire_global_module_hooks()
-        _owns_global_hooks = True
-
-    if _torch_funcs_enabled and HAS_TORCH_FUNC_MODE and _torch_func_mode_instance is None:
+    if eager and _torch_funcs_enabled and HAS_TORCH_FUNC_MODE and _torch_func_mode_instance is None:
         _torch_func_mode_instance = _InspectTorchFuncMode()
         _torch_func_mode_instance.__enter__()
 
     register_step_callback(_on_step_summary)
+    _hooks_activated = True
+
+
+def maybe_activate_hooks() -> None:
+    """Activate hooks if IO inspect is enabled but hooks are not yet entered.
+
+    Called from model_runner at the start of the first ``execute_model()``
+    to defer dispatch mode activation past the memory profiling phase.
+    When the programmatic API (``enable_io_inspect()``) is used, hooks are
+    activated immediately and this is a no-op.
+    """
+    if _enabled and not _hooks_activated:
+        _activate_hooks()
 
 
 def _deactivate_hooks():
-    """Remove all global hooks and exit TorchFunctionMode."""
-    global _torch_func_mode_instance, _owns_global_hooks
+    """Remove all active hooks."""
+    global _torch_func_mode_instance, _dispatch_mode_instance, _hooks_activated
 
     unregister_step_callback(_on_step_summary)
 
-    if _owns_global_hooks:
-        release_global_module_hooks()
-        _owns_global_hooks = False
+    if _dispatch_mode_instance is not None:
+        _dispatch_mode_instance.__exit__(None, None, None)
+        _dispatch_mode_instance = None
 
     if _torch_func_mode_instance is not None:
         _torch_func_mode_instance.__exit__(None, None, None)
         _torch_func_mode_instance = None
+
+    _hooks_activated = False
 
 
 # ── State management ──
@@ -627,13 +780,20 @@ def _reset_state() -> None:
     _rank_filter = None
 
 
-# ── State management ──
+# ── Env-var / YAML initialization ──
 
 
 def _init_from_env() -> None:
-    """Initialize from VLLM_FL_IO_INSPECT* environment variables or YAML config."""
+    """Initialize from VLLM_FL_IO_INSPECT* environment variables or YAML config.
+
+    Skipped when the programmatic API (``enable_io_inspect``) has already been
+    called — the Python API has the highest priority.
+    """
     global _enabled, _match_all, _op_filter, _module_filter, _layer_filter
     global _torch_funcs_enabled, _torch_func_filter, _step_range, _rank_filter
+
+    if _enabled:
+        return
 
     # Reset state first
     _deactivate_hooks()
@@ -657,7 +817,7 @@ def _init_from_env() -> None:
                 _match_all = False
                 _op_filter = set(ops)
                 _module_filter = set(modules)
-            tf_default = (True, set()) if (not ops and not modules) else (False, set())
+            tf_default = (False, set())
             tf_enabled, tf_filter = io_cfg.get("torch_funcs", tf_default)
             _torch_funcs_enabled = tf_enabled
             _torch_func_filter = tf_filter
@@ -666,7 +826,11 @@ def _init_from_env() -> None:
             _enabled = True
 
             _rank_filter = io_cfg.get("ranks")
-            _activate_hooks()
+            # Register step callback but defer dispatch mode activation
+            # to maybe_activate_hooks() (called from model_runner before the
+            # first execute_model).  This avoids interfering with vLLM's
+            # memory profiling which runs between load_model and execute_model.
+            register_step_callback(_on_step_summary)
 
             logger.info(
                 f"IO Inspect enabled (YAML): rank={get_rank()}, "
@@ -707,8 +871,8 @@ def _init_from_env() -> None:
             torch_funcs_val
         )
     else:
-        # Default: enable torch_funcs when inspecting all (match_all mode)
-        _torch_funcs_enabled = _match_all
+        # Default: torch_funcs is opt-in (TorchDispatchMode is the default)
+        _torch_funcs_enabled = False
         _torch_func_filter = set()
 
     # Parse step range (inspector-specific → shared fallback)
@@ -727,7 +891,10 @@ def _init_from_env() -> None:
         if rank_env:
             _rank_filter = parse_rank_filter(rank_env)
 
-        _activate_hooks()
+        # Register step callback but defer dispatch mode activation
+        # to maybe_activate_hooks() (called from model_runner before the
+        # first execute_model).
+        register_step_callback(_on_step_summary)
 
         logger.info(
             f"IO Inspect enabled: rank={get_rank()}, "

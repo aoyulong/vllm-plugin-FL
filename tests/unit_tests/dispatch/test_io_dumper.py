@@ -15,7 +15,7 @@ import torch
 
 from vllm_fl.dispatch import io_dumper
 from vllm_fl.dispatch.io_common import (
-    HAS_GLOBAL_MODULE_HOOKS,
+    HAS_TORCH_DISPATCH_MODE,
     HAS_TORCH_FUNC_MODE,
     advance_step,
     expand_layer_specs,
@@ -515,8 +515,8 @@ class TestShouldDumpTorchFunc:
         assert not _should_dump_torch_func("softmax")
 
 
-class TestGlobalModuleHooks:
-    """Test automatic global module hook registration for dumping."""
+class TestTorchDispatchMode:
+    """Test TorchDispatchMode for ATen-level op interception in dumper."""
 
     def setup_method(self):
         reset_step()
@@ -526,21 +526,21 @@ class TestGlobalModuleHooks:
         disable_io_dump()
 
     @pytest.mark.skipif(
-        not HAS_GLOBAL_MODULE_HOOKS,
-        reason="Global module hooks not available in this PyTorch version",
+        not HAS_TORCH_DISPATCH_MODE,
+        reason="TorchDispatchMode not available in this PyTorch version",
     )
-    def test_global_hooks_auto_registered(self, dump_dir):
-        enable_io_dump(dump_dir, modules={"Linear"})
-        from vllm_fl.dispatch.io_dumper import _owns_global_hooks
+    def test_dispatch_mode_auto_activated(self, dump_dir):
+        enable_io_dump(dump_dir)
+        from vllm_fl.dispatch.io_dumper import _dispatch_mode_instance
 
-        assert _owns_global_hooks is True
+        assert _dispatch_mode_instance is not None
 
     @pytest.mark.skipif(
-        not HAS_GLOBAL_MODULE_HOOKS,
-        reason="Global module hooks not available in this PyTorch version",
+        not HAS_TORCH_DISPATCH_MODE,
+        reason="TorchDispatchMode not available in this PyTorch version",
     )
-    def test_global_hooks_create_files_without_attach(self, dump_dir):
-        """Global hooks should dump files when dump is enabled."""
+    def test_dispatch_mode_creates_files(self, dump_dir):
+        """TorchDispatchMode should dump files when dump is enabled."""
         enable_io_dump(dump_dir, modules={"Linear"}, meta_only=False)
         model = torch.nn.Linear(4, 3)
 
@@ -550,38 +550,37 @@ class TestGlobalModuleHooks:
         # Step stays at 0 (step is advanced by model_runner.execute_model)
         step_dir = os.path.join(dump_dir, "rank_0000", "step_0000")
         assert os.path.isdir(step_dir)
-        found_pt = False
+        found_files = False
         for root, dirs, files in os.walk(step_dir):
             for f in files:
-                if f.endswith(".pt"):
-                    found_pt = True
-        assert found_pt
+                if f.endswith(".pt") or f.endswith(".json"):
+                    found_files = True
+        assert found_files
 
     @pytest.mark.skipif(
-        not HAS_GLOBAL_MODULE_HOOKS,
-        reason="Global module hooks not available in this PyTorch version",
+        not HAS_TORCH_DISPATCH_MODE,
+        reason="TorchDispatchMode not available in this PyTorch version",
     )
-    def test_global_hooks_removed_on_disable(self, dump_dir):
+    def test_dispatch_mode_deactivated_on_disable(self, dump_dir):
         enable_io_dump(dump_dir, modules={"Linear"})
-        from vllm_fl.dispatch.io_dumper import _owns_global_hooks
+        from vllm_fl.dispatch.io_dumper import _dispatch_mode_instance
 
-        assert _owns_global_hooks is True
+        assert _dispatch_mode_instance is not None
         disable_io_dump()
         from vllm_fl.dispatch import io_dumper
 
-        assert io_dumper._owns_global_hooks is False
+        assert io_dumper._dispatch_mode_instance is None
 
     @pytest.mark.skipif(
-        not HAS_GLOBAL_MODULE_HOOKS,
-        reason="Global module hooks not available in this PyTorch version",
+        not HAS_TORCH_DISPATCH_MODE,
+        reason="TorchDispatchMode not available in this PyTorch version",
     )
-    def test_global_hooks_registered_in_match_all(self, dump_dir):
-        """In match-all mode, global module hooks ARE registered
-        to provide module context annotations on dump file labels."""
+    def test_dispatch_mode_activated_in_match_all(self, dump_dir):
+        """In match-all mode, TorchDispatchMode is activated."""
         enable_io_dump(dump_dir)
-        from vllm_fl.dispatch.io_dumper import _owns_global_hooks
+        from vllm_fl.dispatch.io_dumper import _dispatch_mode_instance
 
-        assert _owns_global_hooks is True
+        assert _dispatch_mode_instance is not None
 
 
 class TestDumpTorchFunctionMode:
@@ -640,11 +639,11 @@ class TestDumpTorchFunctionMode:
         not HAS_TORCH_FUNC_MODE,
         reason="TorchFunctionMode not available in this PyTorch version",
     )
-    def test_torch_func_mode_activated_by_default(self, dump_dir):
-        enable_io_dump(dump_dir)  # torch_funcs=True by default
+    def test_torch_func_mode_not_activated_by_default(self, dump_dir):
+        enable_io_dump(dump_dir)  # torch_funcs=False by default
         from vllm_fl.dispatch.io_dumper import _torch_func_mode_instance
 
-        assert _torch_func_mode_instance is not None
+        assert _torch_func_mode_instance is None
 
     @pytest.mark.skipif(
         not HAS_TORCH_FUNC_MODE,
@@ -711,8 +710,8 @@ class TestEnvVarTorchFuncs:
         os.environ.pop("VLLM_FL_IO_DUMP_OPS", None)
         os.environ.pop("VLLM_FL_IO_DUMP_MODULES", None)
         io_dumper._init_from_env()
-        # torch_funcs defaults to True in match-all mode
-        assert io_dumper._torch_funcs_enabled
+        # torch_funcs defaults to False (TorchDispatchMode handles ops)
+        assert not io_dumper._torch_funcs_enabled
 
     @patch.dict(
         os.environ,
@@ -1318,13 +1317,13 @@ class TestLayerFilter:
         assert io_dumper._layer_filter == {"model.layers.0", "model.layers.1"}
 
     @pytest.mark.skipif(
-        not HAS_GLOBAL_MODULE_HOOKS,
-        reason="Global module hooks not available in this PyTorch version",
+        not HAS_TORCH_DISPATCH_MODE,
+        reason="TorchDispatchMode not available in this PyTorch version",
     )
-    def test_layer_filter_acquires_module_hooks(self, dump_dir):
-        """Layer filter needs module hooks for path tracking."""
+    def test_layer_filter_activates_dispatch_mode(self, dump_dir):
+        """Layer filter needs TorchDispatchMode for stack-based path tracking."""
         enable_io_dump(dump_dir, ops={"rms_norm"}, layers={"model.layers.0"})
-        assert io_dumper._owns_global_hooks is True
+        assert io_dumper._dispatch_mode_instance is not None
 
 
 class TestComposableFilters:
@@ -1568,3 +1567,94 @@ class TestTensorStats:
         finally:
             while len(_TENSOR_STAT_REGISTRY) > original_len:
                 _TENSOR_STAT_REGISTRY.pop()
+
+
+class TestSummaryJson:
+    """Test summary.json generation on disable."""
+
+    def setup_method(self):
+        disable_io_dump()
+
+    def teardown_method(self):
+        disable_io_dump()
+
+    def test_summary_written_on_disable(self, dump_dir):
+        """disable_io_dump() should write summary.json under rank dir."""
+        enable_io_dump(dump_dir=dump_dir)
+        t = torch.zeros(2, 3)
+        dump_before("test_op", (t,), {})
+        dump_after("test_op", (t,), t)
+        disable_io_dump()
+
+        summary_path = os.path.join(dump_dir, "rank_0000", "summary.json")
+        assert os.path.isfile(summary_path)
+        with open(summary_path) as f:
+            summary = json.load(f)
+        assert "flaggems_ops" in summary
+        assert "non_flaggems_ops" in summary
+        assert "triton_ops" in summary
+        assert "non_triton_ops" in summary
+        # test_op has no dispatch_keys → non-FlagGems, non-Triton
+        assert "test_op" in summary["non_flaggems_ops"]
+        assert "test_op" in summary["non_triton_ops"]
+
+    def test_summary_empty_when_no_ops(self, dump_dir):
+        """No summary.json when no ops were dumped."""
+        enable_io_dump(dump_dir=dump_dir)
+        disable_io_dump()
+
+        summary_path = os.path.join(dump_dir, "rank_0000", "summary.json")
+        assert not os.path.exists(summary_path)
+
+    def test_summary_flaggems_classification(self, dump_dir):
+        """Ops with FlagGems dispatch keys go into flaggems_ops and triton_ops."""
+        from vllm_fl.dispatch.io_dumper import _lock, _op_summary
+
+        enable_io_dump(dump_dir=dump_dir)
+        # Manually inject a FlagGems op entry
+        with _lock:
+            _op_summary["aten.mm"] = {
+                "dispatch_keys": "[(CUDA, FlagGems, False)]",
+                "is_triton": True,
+                "call_count": 5,
+            }
+            _op_summary["aten.add"] = {
+                "dispatch_keys": "[(CPU, CPU, False)]",
+                "is_triton": False,
+                "call_count": 3,
+            }
+        disable_io_dump()
+
+        summary_path = os.path.join(dump_dir, "rank_0000", "summary.json")
+        assert os.path.isfile(summary_path)
+        with open(summary_path) as f:
+            summary = json.load(f)
+        assert "aten.mm" in summary["flaggems_ops"]
+        assert "aten.add" in summary["non_flaggems_ops"]
+        assert "aten.mm" not in summary["non_flaggems_ops"]
+        # FlagGems ops are also Triton ops
+        assert "aten.mm" in summary["triton_ops"]
+        assert "aten.add" in summary["non_triton_ops"]
+        assert "aten.mm" not in summary["non_triton_ops"]
+
+    def test_summary_multiple_ops(self, dump_dir):
+        """Multiple ops are collected across calls."""
+        enable_io_dump(dump_dir=dump_dir)
+        t = torch.zeros(2)
+        dump_before("op_a", (t,), {})
+        dump_after("op_a", (t,), t)
+        dump_before("op_b", (t,), {})
+        dump_after("op_b", (t,), t)
+        dump_before("op_a", (t,), {})
+        dump_after("op_a", (t,), t)
+        disable_io_dump()
+
+        summary_path = os.path.join(dump_dir, "rank_0000", "summary.json")
+        with open(summary_path) as f:
+            summary = json.load(f)
+        non_fg = summary["non_flaggems_ops"]
+        assert "op_a" in non_fg
+        assert "op_b" in non_fg
+        non_tr = summary["non_triton_ops"]
+        assert "op_a" in non_tr
+        assert "op_b" in non_tr

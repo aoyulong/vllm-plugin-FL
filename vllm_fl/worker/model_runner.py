@@ -224,6 +224,28 @@ logger = init_logger(__name__)
 _io_advance_step = None
 _io_inspect_enabled = None
 _io_dump_enabled = None
+_io_hooks_activated = False
+
+
+def _maybe_activate_io_hooks() -> None:
+    """Activate IO dispatch modes if not yet done (once per process).
+
+    ``_init_from_env()`` parses config and sets ``_enabled = True`` during
+    ``load_model()``, but defers dispatch mode activation so that the
+    modes don't interfere with vLLM's ``determine_available_memory()``.
+    This function enters the modes just before the first ``execute_model()``.
+    """
+    global _io_hooks_activated
+    if _io_hooks_activated:
+        return
+    _io_hooks_activated = True
+    try:
+        from vllm_fl.dispatch.io_inspector import maybe_activate_hooks as _act_inspect
+        from vllm_fl.dispatch.io_dumper import maybe_activate_hooks as _act_dump
+        _act_inspect()
+        _act_dump()
+    except Exception as exc:
+        logger.warning("Failed to activate IO hooks: %s", exc)
 
 
 def _maybe_advance_io_step() -> None:
@@ -2967,6 +2989,10 @@ class ModelRunnerFL(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        # Activate IO dispatch modes on the first call (deferred from
+        # load_model to avoid interfering with memory profiling).
+        _maybe_activate_io_hooks()
+
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -3733,11 +3759,11 @@ class ModelRunnerFL(
         from vllm_fl.dispatch.io_common import register_module_paths, set_eager_mode
         register_module_paths(self.model)
         # Tell the IO system whether torch.compile will be used so it can
-        # skip global module hooks that interfere with AOT autograd.
+        # skip TorchFunctionMode (incompatible with torch.compile).
         set_eager_mode(getattr(self.model_config, "enforce_eager", False))
         # Initialize IO inspector/dumper from env vars or YAML config.
         # This must happen AFTER set_eager_mode() so _activate_hooks() knows
-        # whether to register global module hooks (incompatible with torch.compile).
+        # whether to enable TorchFunctionMode (eager-only, opt-in).
         _io_env_prefixes = ("VLLM_FL_IO_INSPECT", "VLLM_FL_IO_DUMP",
                             "VLLM_FL_IO_STEP_RANGE", "VLLM_FL_IO_LAYERS",
                             "VLLM_FL_IO_RANK")

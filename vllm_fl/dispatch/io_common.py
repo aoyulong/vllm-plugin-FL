@@ -11,6 +11,7 @@ parsing used by both io_inspector.py and io_dumper.py.
 from __future__ import annotations
 
 import fnmatch
+import inspect
 import logging
 import os
 import re
@@ -18,6 +19,7 @@ import threading
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
+import torch.nn as nn
 
 _logger = logging.getLogger(__name__)
 
@@ -31,13 +33,11 @@ except ImportError:
     HAS_TORCH_FUNC_MODE = False
 
 try:
-    from torch.nn.modules.module import (
-        register_module_forward_pre_hook,
-        register_module_forward_hook,
-    )
-    HAS_GLOBAL_MODULE_HOOKS = True
+    from torch.utils._python_dispatch import TorchDispatchMode  # type: ignore[attr-defined]
+    HAS_TORCH_DISPATCH_MODE = True
 except ImportError:
-    HAS_GLOBAL_MODULE_HOOKS = False
+    TorchDispatchMode = None  # type: ignore[misc,assignment]
+    HAS_TORCH_DISPATCH_MODE = False
 
 
 _eager_mode_override: Optional[bool] = None
@@ -77,10 +77,9 @@ def warn_if_not_eager(subsystem: str) -> None:
     """
     if not _is_eager_mode():
         _logger.warning(
-            "[%s] torch.compile detected. Use enforce_eager=True "
-            "for more comprehensive IO interception (torch function "
-            "tracing and global module hooks may be partially bypassed "
-            "by compiled regions).",
+            "[%s] torch.compile detected. TorchDispatchMode is active for "
+            "ATen-level op interception. Use enforce_eager=True for "
+            "additional TorchFunctionMode interception.",
             subsystem,
         )
 
@@ -671,6 +670,443 @@ def should_inspect_torch_func(
     return True
 
 
+# ── Dispatch op filtering (TorchDispatchMode) ──
+
+SKIP_DISPATCH_OPS = frozenset({
+    # Memory/allocation ops
+    "empty", "empty_like", "empty_strided", "zeros", "zeros_like",
+    "ones", "ones_like", "full", "full_like",
+    # View/metadata ops
+    "detach", "lift_fresh", "lift_fresh_copy",
+    "t", "transpose", "expand", "view", "reshape", "contiguous",
+    "slice", "select", "unsqueeze", "squeeze",
+    "_unsafe_view", "as_strided",
+    # Copy/conversion
+    "copy_", "to", "_to_copy",
+    # Size/shape queries (non-tensor returns)
+    "sym_size", "sym_stride", "sym_numel",
+})
+
+
+def get_dispatch_op_name(func) -> str:
+    """Extract short name from an ATen OpOverload.
+
+    Examples::
+
+        aten::mm           -> mm
+        aten::_softmax     -> _softmax
+        vllm::rms_norm     -> rms_norm
+        mylib::my_add      -> my_add
+    """
+    if hasattr(func, "name"):
+        full = func.name()  # e.g. "aten::mm"
+        return full.split("::")[-1] if "::" in full else full
+    return str(func)
+
+
+def get_dispatch_op_namespace(func) -> str:
+    """Extract namespace from an ATen OpOverload (e.g. 'aten', 'vllm')."""
+    return getattr(func, "namespace", "aten")
+
+
+# ── Dispatch key & backend detection ──
+#
+# Uses ``torch._C._dispatch_dump_table`` as the single source of truth.
+# The table is parsed once per op (cached) to extract all registered
+# ``[kernel]`` and ``[default backend kernel]`` entries as
+# ``(dispatch_key, impl, is_default)`` triples.  Third-party backends
+# like FlagGems are detected from the kernel registration path.
+
+# Cache: op_qualified_name -> List[(dispatch_key, impl, is_default)]
+_dispatch_table_cache: Dict[str, List[Tuple[str, str, bool]]] = {}
+
+
+# Regex to extract backend name from PyTorch C++ registration paths like:
+#   /pytorch/build/aten/src/ATen/RegisterCPU_0.cpp:3456
+#   /pytorch/build/aten/src/ATen/RegisterCompositeExplicitAutogradNonFunctional_0.cpp:7805
+_REGISTER_PATTERN = re.compile(r"Register(\w+?)_\d+\.cpp")
+
+# Known third-party package names → display labels.
+# Checked in order; first match wins.  "triton" is intentionally last so that
+# more specific packages (e.g. flag_gems, which *uses* triton) win first.
+_THIRD_PARTY_BACKENDS = {
+    "flag_gems": "FlagGems",
+    "triton": "Triton",
+}
+
+# Backends known to be Triton-based (used for is_triton classification)
+_TRITON_BACKENDS = {"FlagGems", "Triton"}
+
+
+def _infer_backend_from_path(reg_path: str) -> str:
+    """Infer the backend name from a kernel registration path.
+
+    Examples::
+
+        /pytorch/build/.../RegisterCPU_0.cpp:3456           -> "CPU"
+        /pytorch/build/.../RegisterCUDA_0.cpp:16060          -> "CUDA"
+        /pytorch/build/.../RegisterCompositeExplicit..._0.cpp -> "CompositeExplicitAutogradNonFunctional"
+        /.../flag_gems/__init__.py:20                        -> "FlagGems"
+        /.../triton/ops/matmul.py:42                         -> "Triton"
+        /.../torch/_meta_registrations.py:50                 -> "Meta"
+        /.../torch/csrc/autograd/generated/TraceType_3.cpp   -> "Tracer"
+    """
+    path_lower = reg_path.lower()
+
+    # Check third-party packages first
+    for pkg, label in _THIRD_PARTY_BACKENDS.items():
+        if pkg in path_lower:
+            return label
+
+    # Try Register<BackendName>_N.cpp pattern (C++ registrations)
+    # Extract filename from path
+    fname = reg_path.rsplit("/", 1)[-1] if "/" in reg_path else reg_path
+    m = _REGISTER_PATTERN.match(fname)
+    if m:
+        return m.group(1)
+
+    # Python meta registrations
+    if "_meta_registrations" in path_lower:
+        return "Meta"
+
+    return "unknown"
+
+
+def _parse_dispatch_table(func) -> List[Tuple[str, str, bool]]:
+    """Parse ``_dispatch_dump_table`` for an op, returning all registered kernels.
+
+    Returns a cached list of ``(dispatch_key, impl, is_default)`` triples:
+
+    - **dispatch_key**: The dispatch key name (e.g. ``"CUDA"``, ``"CPU"``).
+    - **impl**: The backend implementation inferred from the registration
+      path (e.g. ``"CPU"``, ``"FlagGems"``,
+      ``"CompositeExplicitAutogradNonFunctional"``).
+    - **is_default**: ``True`` when the entry is a ``[default backend kernel]``
+      (fallback), ``False`` for a dedicated ``[kernel]``.
+
+    Excludes fallthrough entries.
+    """
+    op_qname = func.name() if hasattr(func, "name") else None
+    if op_qname is None:
+        return []
+
+    cached = _dispatch_table_cache.get(op_qname)
+    if cached is not None:
+        return cached
+
+    entries: List[Tuple[str, str, bool]] = []
+    try:
+        table = torch._C._dispatch_dump_table(op_qname)
+        for line in table.split("\n"):
+            stripped = line.strip()
+            is_kernel = "[kernel]" in stripped
+            is_default = "[default backend kernel]" in stripped
+            if not is_kernel and not is_default:
+                continue
+            if "fallthrough" in stripped:
+                continue
+            colon_idx = stripped.find(": registered at ")
+            if colon_idx < 0:
+                continue
+            key = stripped[:colon_idx].strip()
+            reg_path = stripped[colon_idx + 16:].split(" [")[0]
+            impl = _infer_backend_from_path(reg_path)
+            entries.append((key, impl, is_default))
+    except Exception:
+        pass
+
+    _dispatch_table_cache[op_qname] = entries
+    return entries
+
+
+def get_dispatch_keys(
+    func, args: tuple = (), kwargs: dict = None,
+) -> List[Tuple[str, str, bool]]:
+    """Return all registered dispatch keys for an op.
+
+    Returns the cached ``(dispatch_key, impl, is_default)`` list from
+    :func:`_parse_dispatch_table`.  See that function for field descriptions.
+
+    Example return value::
+
+        [("CPU", "CPU", False),
+         ("CUDA", "FlagGems", False),
+         ("HIP", "CompositeExplicitAutogradNonFunctional", True),
+         ("Meta", "Meta", False)]
+    """
+    entries = _parse_dispatch_table(func)
+    if not entries:
+        return [("unknown", "unknown", True)]
+    return entries
+
+
+# Cache for is_triton_op results: op_name -> bool.
+# Cleared on step advance so runtime changes (e.g. backend switch) are picked up.
+_triton_op_cache: Dict[str, bool] = {}
+
+
+def _is_triton_from_dispatch_keys(
+    dispatch_keys: List[Tuple[str, str, bool]],
+) -> bool:
+    """Check dispatch key registrations for Triton-based backends."""
+    return any(
+        impl in _TRITON_BACKENDS
+        for _key, impl, is_default in dispatch_keys
+        if not is_default
+    )
+
+
+def _is_triton_from_op_manager(op_name: str) -> bool:
+    """Check if OpManager resolved this op to a flagos (FlagGems/Triton) backend."""
+    try:
+        from .manager import get_default_manager
+        from .types import BackendImplKind
+        mgr = get_default_manager()
+        # Check the actually-called implementation first
+        impl_id = mgr._called_ops.get(op_name)
+        if impl_id:
+            snap = mgr._registry.snapshot()
+            for imp in snap.impls_by_op.get(op_name, []):
+                if imp.impl_id == impl_id:
+                    return imp.kind == BackendImplKind.DEFAULT
+    except Exception:
+        pass
+    return False
+
+
+# Triton kernel launch indicators.
+# - cuLaunchKernelEx: CUDA driver API used by FlagGems / user Triton kernels
+#   (native CUDA ops use cudaLaunchKernel instead).
+# - triton_: torch.compile/inductor names its generated kernels with this prefix
+#   (e.g. triton_poi_fused_add_mul_0, triton_red_fused_1).
+# New backends may add their own launch API names here.
+_TRITON_LAUNCH_EVENTS = {"cuLaunchKernelEx"}
+_TRITON_KERNEL_PREFIX = "triton_"
+
+
+def _get_profiler_activities():
+    """Return ``[CPU, <device>]`` profiler activities for the current accelerator.
+
+    Uses ``torch.accelerator.current_accelerator()`` to pick the right
+    device activity (CUDA, XPU, HPU, …) so the profiler check works on
+    any backend that has Triton support.  Falls back to CPU-only if no
+    accelerator is available.
+    """
+    from torch.profiler import ProfilerActivity
+    activities = [ProfilerActivity.CPU]
+    try:
+        accel = str(torch.accelerator.current_accelerator()).upper()
+        device_activity = getattr(ProfilerActivity, accel, None)
+        if device_activity is not None:
+            activities.append(device_activity)
+    except Exception:
+        pass
+    return activities
+
+
+def _is_triton_from_profiler(
+    func,
+    args: tuple = (),
+    kwargs: Optional[dict] = None,
+) -> bool:
+    """Run the op once under ``torch.profiler`` and inspect profiler events.
+
+    Detects Triton kernels by two device-agnostic signals (~3-4 ms overhead):
+
+    1. **Launch event**: Triton kernels are launched via ``cuLaunchKernelEx``
+       (CUDA) or an equivalent driver API, while native vendor libraries
+       (cuBLAS, oneDNN, …) use ``cudaLaunchKernel`` / similar.
+    2. **Kernel name prefix**: ``torch.compile``/inductor names its generated
+       Triton kernels ``triton_poi_*``, ``triton_red_*``, etc.
+
+    The profiler activities are chosen automatically based on
+    ``torch.accelerator.current_accelerator()`` so this works on CUDA, XPU,
+    HPU, or any backend with Triton support.
+
+    Only called when the fast static checks (dispatch table, OpManager) are
+    inconclusive.  Results are cached per op name so each op is profiled at
+    most once.
+    """
+    try:
+        from torch.profiler import profile
+        kwargs = kwargs or {}
+        activities = _get_profiler_activities()
+        with profile(activities=activities) as prof:
+            func(*args, **kwargs)
+            try:
+                torch.accelerator.synchronize()
+            except Exception:
+                pass
+
+        for evt in prof.events():
+            name = evt.name
+            # Signal 1: Triton-specific kernel launch API
+            if name in _TRITON_LAUNCH_EVENTS:
+                return True
+            # Signal 2: inductor-generated triton kernel name
+            if name.startswith(_TRITON_KERNEL_PREFIX):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def is_triton_op(
+    op_name: str = "",
+    dispatch_keys: Optional[List[Tuple[str, str, bool]]] = None,
+    func=None,
+    args: tuple = (),
+    kwargs: Optional[dict] = None,
+) -> bool:
+    """Check if an op is backed by a Triton kernel.
+
+    Uses a layered detection strategy (cheapest first, cached per op):
+
+    1. **Dispatch table** (static, ~0 cost): check if any non-default
+       dispatch key implementation is from a known Triton-based backend
+       (FlagGems, Triton, or anything in ``_TRITON_BACKENDS``).
+       Works in both eager and compile modes because the dispatch table
+       is static kernel registration metadata.
+
+    2. **OpManager registry** (static, ~0 cost): check if the resolved
+       implementation has ``kind == BackendImplKind.DEFAULT`` (flagos),
+       which means FlagGems / Triton.  Covers Python-level dispatch.
+
+    3. **Profiler** (runtime, ~3-4 ms — only when *func* is provided
+       and the static checks are inconclusive): run the op once under
+       ``torch.profiler`` and inspect events for ``cuLaunchKernelEx``
+       (FlagGems / user Triton kernels) or ``triton_`` kernel name
+       prefix (torch.compile / inductor).
+
+    Results are cached per ``op_name`` so each op is profiled at most once.
+    """
+    # Fast path: check cache
+    if op_name and op_name in _triton_op_cache:
+        return _triton_op_cache[op_name]
+
+    result = False
+
+    # Strategy 1: dispatch key registrations
+    if dispatch_keys and _is_triton_from_dispatch_keys(dispatch_keys):
+        result = True
+
+    # Strategy 2: OpManager registry
+    if not result and op_name and _is_triton_from_op_manager(op_name):
+        result = True
+
+    # Strategy 3: profiler (expensive, only when func is provided)
+    if not result and func is not None:
+        result = _is_triton_from_profiler(func, args, kwargs)
+
+    # Cache the result
+    if op_name:
+        _triton_op_cache[op_name] = result
+    return result
+
+
+def should_inspect_dispatch_op(
+    op_name: str,
+    match_all: bool,
+    op_filter: Set[str],
+) -> bool:
+    """Check if a dispatch op should be intercepted.
+
+    Args:
+        op_name: Short op name (e.g. 'mm', 'rms_norm').
+        match_all: Whether all ops are being captured.
+        op_filter: Specific op names to match (empty means all).
+    """
+    if op_name in SKIP_DISPATCH_OPS:
+        return False
+    if op_filter and op_name not in op_filter:
+        return False
+    return True
+
+
+# ── Stack-based module context extraction ──
+#
+# Used by TorchDispatchMode to derive module context from the Python call
+# stack, without requiring global module hooks.  Works in both eager and
+# compiled modes.
+
+def get_module_context_from_stack() -> List[Tuple[str, str]]:
+    """Walk the Python call stack to find enclosing nn.Module instances.
+
+    Returns a list of ``(class_name, module_path)`` pairs, innermost first.
+    ``module_path`` is looked up from the module path registry (populated
+    by :func:`register_module_paths`); it is empty string if not found.
+
+    This is a debugging tool — the stack walk has a small performance cost
+    (~0.18ms per call for a 10-layer model).
+    """
+    frame = inspect.currentframe()
+    result: List[Tuple[str, str]] = []
+    seen_ids: Set[int] = set()
+    try:
+        f = frame.f_back if frame is not None else None
+        while f is not None:
+            local_self = f.f_locals.get("self")
+            if (
+                local_self is not None
+                and isinstance(local_self, nn.Module)
+                and f.f_code.co_name in ("forward", "_call_impl")
+                and id(local_self) not in seen_ids
+            ):
+                seen_ids.add(id(local_self))
+                cls_name = type(local_self).__name__
+                path = _module_path_map.get(id(local_self), "")
+                result.append((cls_name, path))
+            f = f.f_back
+    finally:
+        del frame
+    return result
+
+
+def layer_path_matches_from_stack(
+    filter_set: Set[str],
+    module_ctx: Optional[List[Tuple[str, str]]] = None,
+) -> bool:
+    """Check if any module in the given context matches the layer filter.
+
+    Like :func:`layer_path_matches` but uses stack-derived context instead
+    of the global module hook context stack.
+
+    Args:
+        filter_set: Set of layer path patterns (prefix or glob).
+        module_ctx: Output of :func:`get_module_context_from_stack`.
+            If None, derives it automatically.
+    """
+    if module_ctx is None:
+        module_ctx = get_module_context_from_stack()
+    for _cls_name, path in module_ctx:
+        if not path:
+            continue
+        for pattern in filter_set:
+            if _is_glob(pattern):
+                if fnmatch.fnmatch(path, pattern):
+                    return True
+            else:
+                if path == pattern or path.startswith(pattern + "."):
+                    return True
+    return False
+
+
+def module_context_matches_from_stack(
+    filter_set: Set[str],
+    module_ctx: Optional[List[Tuple[str, str]]] = None,
+) -> bool:
+    """Check if any module class name in the stack context matches the filter.
+
+    Like :func:`module_context_matches` but uses stack-derived context.
+    """
+    if module_ctx is None:
+        module_ctx = get_module_context_from_stack()
+    for cls_name, _path in module_ctx:
+        if cls_name in filter_set:
+            return True
+    return False
+
+
 # ── Tensor statistics (shared by inspector and dumper) ──
 #
 # Extensible registry: users can add custom stats via register_tensor_stat().
@@ -858,22 +1294,56 @@ def make_op_tag(op_name: str) -> str:
     return f"[op={idx},{count}]"
 
 
-def make_label(op_name: str, args: tuple = ()) -> str:
-    """Build a display label like ``rms_norm (module=Linear, layer=model.layers.0)``."""
-    module_name = get_module_class_name(args) or get_current_module()
-    path = get_current_module_path()
+def make_label(
+    op_name: str,
+    args: tuple = (),
+    module_name: Optional[str] = None,
+    layer_path: Optional[str] = None,
+    dispatch_keys: Optional[List[Tuple[str, str, bool]]] = None,
+) -> str:
+    """Build a display label for an op call.
+
+    Example output::
+
+        mm (module=Linear, layer=model.layers.0, is_triton=True, dispatch_keys=[(CUDA, FlagGems), (CPU, CPU)])
+
+    Args:
+        op_name: Operator name.
+        args: Operator args (used to detect module from args[0] via old hooks).
+        module_name: Explicit module class name (from stack-based context).
+        layer_path: Explicit layer path (from stack-based context).
+        dispatch_keys: Full ``(key, impl, is_default)`` list from
+            :func:`get_dispatch_keys`.
+    """
+    if module_name is None:
+        module_name = get_module_class_name(args) or get_current_module()
+    if layer_path is None:
+        layer_path = get_current_module_path()
     parts = [f"module={module_name or ''}"]
-    if path:
-        parts.append(f"layer={path}")
+    if layer_path:
+        parts.append(f"layer={layer_path}")
+    parts.append(f"is_triton={is_triton_op(op_name, dispatch_keys)}")
+    if dispatch_keys is not None:
+        dk_items = [f"({k}, {impl})" for k, impl, _default in dispatch_keys]
+        parts.append(f"dispatch_keys=[{', '.join(dk_items)}]")
     return f"{op_name} ({', '.join(parts)})"
 
 
-def record_seen(op_name: str, args: tuple = ()) -> None:
+def record_seen(
+    op_name: str,
+    args: tuple = (),
+    module_name: Optional[str] = None,
+) -> None:
     """Record an op and its enclosing module as seen this step (for summary).
 
-    Detects the module name from args[0] (if nn.Module) or the module context.
+    Args:
+        op_name: Operator name.
+        args: Operator args (used to detect module from args[0] via old hooks).
+        module_name: Explicit module class name (from stack-based context).
+            Overrides args-based and global-hook-based detection.
     """
-    module_name = get_module_class_name(args) or get_current_module()
+    if module_name is None:
+        module_name = get_module_class_name(args) or get_current_module()
     with _counter_lock:
         _seen_ops.add(op_name)
         if module_name:
@@ -930,56 +1400,6 @@ def release_torch_func_tags() -> None:
         _tf_tags.module_tag = None
         _tf_tags.op_tag = None
         _tf_tags.exec_order = None
-
-
-# ── Global module hooks (context tracking only) ──
-#
-# Shared by inspector and dumper.  These hooks push/pop the module class
-# name onto a thread-local context stack so op hooks and TorchFunctionMode
-# know which module(s) are currently executing.  They do NOT log or dump.
-#
-# Refcounted: when both inspector and dumper are active, hooks are
-# registered only once and removed when the last user releases.
-
-_global_hook_lock = threading.Lock()
-_global_hook_refcount = 0
-_global_hook_handles: List[Any] = []
-
-
-def _global_forward_pre_hook(module, args):
-    """Push module onto the context stack before forward."""
-    if torch.compiler.is_compiling():
-        return
-    push_module_context(type(module).__name__, module)
-
-
-def _global_forward_post_hook(module, args, output):
-    """Pop module from the context stack after forward."""
-    if torch.compiler.is_compiling():
-        return
-    pop_module_context()
-
-
-def acquire_global_module_hooks() -> None:
-    """Register global module hooks (refcounted, safe to call multiple times)."""
-    global _global_hook_refcount
-    with _global_hook_lock:
-        _global_hook_refcount += 1
-        if _global_hook_refcount == 1 and HAS_GLOBAL_MODULE_HOOKS:
-            h1 = register_module_forward_pre_hook(_global_forward_pre_hook)
-            h2 = register_module_forward_hook(_global_forward_post_hook)
-            _global_hook_handles.extend([h1, h2])
-
-
-def release_global_module_hooks() -> None:
-    """Unregister global module hooks when the last user releases."""
-    global _global_hook_refcount
-    with _global_hook_lock:
-        _global_hook_refcount = max(0, _global_hook_refcount - 1)
-        if _global_hook_refcount == 0:
-            for h in _global_hook_handles:
-                h.remove()
-            _global_hook_handles.clear()
 
 
 # ── YAML config parsing ──

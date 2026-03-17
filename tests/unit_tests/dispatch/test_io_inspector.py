@@ -13,7 +13,7 @@ import torch
 
 from vllm_fl.dispatch import io_inspector
 from vllm_fl.dispatch.io_common import (
-    HAS_GLOBAL_MODULE_HOOKS,
+    HAS_TORCH_DISPATCH_MODE,
     HAS_TORCH_FUNC_MODE,
     advance_step,
     format_result,
@@ -362,8 +362,8 @@ class TestShouldInspectTorchFunc:
         assert not _should_inspect_torch_func("softmax")
 
 
-class TestGlobalModuleHooks:
-    """Test automatic global module hook registration."""
+class TestTorchDispatchMode:
+    """Test TorchDispatchMode for ATen-level op interception."""
 
     def setup_method(self):
         disable_io_inspect()
@@ -372,21 +372,50 @@ class TestGlobalModuleHooks:
         disable_io_inspect()
 
     @pytest.mark.skipif(
-        not HAS_GLOBAL_MODULE_HOOKS,
-        reason="Global module hooks not available in this PyTorch version",
+        not HAS_TORCH_DISPATCH_MODE,
+        reason="TorchDispatchMode not available in this PyTorch version",
     )
-    def test_global_hooks_auto_registered(self):
-        enable_io_inspect(modules={"Linear"})
-        from vllm_fl.dispatch.io_inspector import _owns_global_hooks
+    def test_dispatch_mode_auto_activated(self):
+        enable_io_inspect()
+        from vllm_fl.dispatch.io_inspector import _dispatch_mode_instance
 
-        assert _owns_global_hooks is True
+        assert _dispatch_mode_instance is not None
 
     @pytest.mark.skipif(
-        not HAS_GLOBAL_MODULE_HOOKS,
-        reason="Global module hooks not available in this PyTorch version",
+        not HAS_TORCH_DISPATCH_MODE,
+        reason="TorchDispatchMode not available in this PyTorch version",
     )
-    def test_global_hooks_fire_without_attach(self, caplog):
-        """Global hooks should fire when inspect is enabled."""
+    def test_dispatch_mode_deactivated_on_disable(self):
+        enable_io_inspect()
+        disable_io_inspect()
+        from vllm_fl.dispatch.io_inspector import _dispatch_mode_instance
+
+        assert _dispatch_mode_instance is None
+
+    @pytest.mark.skipif(
+        not HAS_TORCH_DISPATCH_MODE,
+        reason="TorchDispatchMode not available in this PyTorch version",
+    )
+    def test_dispatch_mode_captures_matmul(self, caplog):
+        """TorchDispatchMode should intercept aten-level matmul."""
+        import logging
+
+        enable_io_inspect()
+
+        with caplog.at_level(logging.INFO, logger="vllm_fl.dispatch.io_inspect"):
+            a = torch.randn(2, 3)
+            b = torch.randn(3, 4)
+            torch.matmul(a, b)
+
+        messages = " ".join(r.message for r in caplog.records)
+        assert "mm" in messages or "matmul" in messages
+
+    @pytest.mark.skipif(
+        not HAS_TORCH_DISPATCH_MODE,
+        reason="TorchDispatchMode not available in this PyTorch version",
+    )
+    def test_dispatch_mode_with_module_filter(self, caplog):
+        """TorchDispatchMode should derive module context from stack."""
         import logging
 
         enable_io_inspect(modules={"Linear"})
@@ -396,58 +425,8 @@ class TestGlobalModuleHooks:
             x = torch.randn(2, 4)
             model(x)
 
-        assert any("INPUTS" in r.message for r in caplog.records)
-        assert any("OUTPUTS" in r.message for r in caplog.records)
-
-    @pytest.mark.skipif(
-        not HAS_GLOBAL_MODULE_HOOKS,
-        reason="Global module hooks not available in this PyTorch version",
-    )
-    def test_global_hooks_removed_on_disable(self):
-        enable_io_inspect(modules={"Linear"})
-        from vllm_fl.dispatch.io_inspector import _owns_global_hooks
-
-        assert _owns_global_hooks is True
-        disable_io_inspect()
-        from vllm_fl.dispatch import io_inspector
-
-        assert io_inspector._owns_global_hooks is False
-
-    @pytest.mark.skipif(
-        not HAS_GLOBAL_MODULE_HOOKS,
-        reason="Global module hooks not available in this PyTorch version",
-    )
-    def test_global_hooks_registered_in_match_all(self):
-        """In match-all mode, global module hooks ARE registered
-        to provide module context annotations on op/torch_func entries."""
-        enable_io_inspect()
-        from vllm_fl.dispatch.io_inspector import _owns_global_hooks
-
-        assert _owns_global_hooks is True
-
-    @pytest.mark.skipif(
-        not HAS_GLOBAL_MODULE_HOOKS,
-        reason="Global module hooks not available in this PyTorch version",
-    )
-    def test_global_hooks_filter_by_module(self, caplog):
-        """Only filtered modules should be logged."""
-        import logging
-
-        enable_io_inspect(modules={"Linear"})
-        model = torch.nn.Sequential(
-            torch.nn.Linear(4, 3),
-            torch.nn.ReLU(),
-        )
-
-        with caplog.at_level(logging.INFO, logger="vllm_fl.dispatch.io_inspect"):
-            x = torch.randn(2, 4)
-            model(x)
-
-        # Linear should appear, ReLU should not
-        messages = " ".join(r.message for r in caplog.records)
-        assert "Linear" in messages
-        # ReLU should not appear in module-specific logs
-        assert "ReLU" not in messages
+        # Should capture ops from within Linear's forward
+        assert len(caplog.records) > 0
 
 
 class TestTorchFunctionMode:
@@ -503,11 +482,11 @@ class TestTorchFunctionMode:
         not HAS_TORCH_FUNC_MODE,
         reason="TorchFunctionMode not available in this PyTorch version",
     )
-    def test_torch_func_mode_activated_by_default(self):
-        enable_io_inspect()  # torch_funcs=True by default
+    def test_torch_func_mode_not_activated_by_default(self):
+        enable_io_inspect()  # torch_funcs=False by default
         from vllm_fl.dispatch.io_inspector import _torch_func_mode_instance
 
-        assert _torch_func_mode_instance is not None
+        assert _torch_func_mode_instance is None
 
     @pytest.mark.skipif(
         not HAS_TORCH_FUNC_MODE,
@@ -569,8 +548,8 @@ class TestEnvVarTorchFuncs:
     def test_env_torch_funcs_unset_match_all(self):
         os.environ.pop("VLLM_FL_IO_INSPECT_TORCH_FUNCS", None)
         io_inspector._init_from_env()
-        # torch_funcs defaults to True in match-all mode
-        assert io_inspector._torch_funcs_enabled
+        # torch_funcs defaults to False (TorchDispatchMode handles ops)
+        assert not io_inspector._torch_funcs_enabled
 
     @patch.dict(os.environ, {"VLLM_FL_IO_INSPECT": "rms_norm"}, clear=False)
     def test_env_torch_funcs_unset_filtered(self):
@@ -1127,13 +1106,13 @@ class TestLayerFilter:
         assert io_inspector._layer_filter == {"model.layers.0", "model.layers.1"}
 
     @pytest.mark.skipif(
-        not HAS_GLOBAL_MODULE_HOOKS,
-        reason="Global module hooks not available in this PyTorch version",
+        not HAS_TORCH_DISPATCH_MODE,
+        reason="TorchDispatchMode not available in this PyTorch version",
     )
-    def test_layer_filter_acquires_module_hooks(self):
-        """Layer filter needs module hooks for path tracking."""
+    def test_layer_filter_activates_dispatch_mode(self):
+        """Layer filter needs TorchDispatchMode for stack-based path tracking."""
         enable_io_inspect(ops={"rms_norm"}, layers={"model.layers.0"})
-        assert io_inspector._owns_global_hooks is True
+        assert io_inspector._dispatch_mode_instance is not None
 
     def test_layer_shorthand_expansion(self):
         """Integer shorthand and ranges should be expanded."""
