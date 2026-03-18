@@ -219,7 +219,7 @@ class TestDumpBeforeAfter:
         reset_step()
 
     def test_dump_creates_input_file(self, dump_dir):
-        enable_io_dump(dump_dir, meta_only=False)
+        enable_io_dump(dump_dir, meta_only=False, summary_only=False)
         reset_exec_order()
         t = torch.zeros(2, 3)
         dump_before("test_op", (t,), {"epsilon": 1e-6})
@@ -244,7 +244,7 @@ class TestDumpBeforeAfter:
         assert meta["exec_order"] >= 1
 
     def test_dump_creates_output_file(self, dump_dir):
-        enable_io_dump(dump_dir, meta_only=False)
+        enable_io_dump(dump_dir, meta_only=False, summary_only=False)
         reset_exec_order()
         t_in = torch.zeros(2, 3)
         # Call dump_before first to set call counter
@@ -270,7 +270,7 @@ class TestDumpBeforeAfter:
         assert "op_name" in meta
 
     def test_dump_tuple_output(self, dump_dir):
-        enable_io_dump(dump_dir, meta_only=False)
+        enable_io_dump(dump_dir, meta_only=False, summary_only=False)
         reset_exec_order()
         t_in = torch.zeros(2)
         dump_before("test_op", (t_in,), {})
@@ -320,7 +320,7 @@ class TestIoDumpStep:
         assert io_dumper._call_counters == {}
 
     def test_dump_files_in_different_steps(self, dump_dir):
-        enable_io_dump(dump_dir, meta_only=False)
+        enable_io_dump(dump_dir, meta_only=False, summary_only=False)
         reset_exec_order()
         t = torch.zeros(2)
 
@@ -541,7 +541,9 @@ class TestTorchDispatchMode:
     )
     def test_dispatch_mode_creates_files(self, dump_dir):
         """TorchDispatchMode should dump files when dump is enabled."""
-        enable_io_dump(dump_dir, modules={"Linear"}, meta_only=False)
+        enable_io_dump(
+            dump_dir, modules={"Linear"}, meta_only=False, summary_only=False
+        )
         model = torch.nn.Linear(4, 3)
 
         x = torch.randn(2, 4)
@@ -619,7 +621,13 @@ class TestDumpTorchFunctionMode:
         reason="TorchFunctionMode not available in this PyTorch version",
     )
     def test_torch_func_mode_dumps_matmul(self, dump_dir):
-        enable_io_dump(dump_dir, ops={"matmul"}, torch_funcs=True, meta_only=False)
+        enable_io_dump(
+            dump_dir,
+            ops={"matmul"},
+            torch_funcs=True,
+            meta_only=False,
+            summary_only=False,
+        )
 
         a = torch.randn(2, 3)
         b = torch.randn(3, 4)
@@ -749,7 +757,7 @@ class TestExecOrder:
         assert get_exec_order() == 0
 
     def test_dump_files_contain_exec_order(self, dump_dir):
-        enable_io_dump(dump_dir)
+        enable_io_dump(dump_dir, summary_only=False)
         reset_exec_order()
         t = torch.zeros(2, 3)
         dump_before("op_a", (t,), {})
@@ -765,9 +773,9 @@ class TestExecOrder:
             assert "exec_order" in meta
 
     def test_dump_metadata_has_exec_order(self, dump_dir):
-        enable_io_dump(dump_dir, torch_funcs=False)
-        reset_exec_order()
+        enable_io_dump(dump_dir, torch_funcs=False, summary_only=False)
         t = torch.zeros(2)
+        reset_exec_order()
         dump_before("test_op", (t,), {})
 
         step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
@@ -778,7 +786,7 @@ class TestExecOrder:
         assert meta["exec_order"] == 1
 
     def test_io_dump_step_resets_exec_order(self, dump_dir):
-        enable_io_dump(dump_dir, torch_funcs=False)
+        enable_io_dump(dump_dir, torch_funcs=False, summary_only=False)
         t = torch.zeros(2)
         dump_before("test_op", (t,), {})
         assert get_exec_order() >= 1
@@ -889,7 +897,7 @@ class TestDumpCleanup:
         reset_exec_order()
 
     def test_cleanup_pops_stale_pairing(self, dump_dir):
-        enable_io_dump(dump_dir, meta_only=False)
+        enable_io_dump(dump_dir, meta_only=False, summary_only=False)
         reset_exec_order()
         t = torch.zeros(2)
 
@@ -927,7 +935,7 @@ class TestExecOrderParam:
         reset_exec_order()
 
     def test_dump_before_uses_given_order(self, dump_dir):
-        enable_io_dump(dump_dir, meta_only=False)
+        enable_io_dump(dump_dir, meta_only=False, summary_only=False)
         t = torch.zeros(2)
 
         dump_before("test_op", (t,), {}, exec_order=99)
@@ -941,7 +949,7 @@ class TestExecOrderParam:
         assert meta["exec_order"] == 99
 
     def test_dump_before_none_order_allocates_internally(self, dump_dir):
-        enable_io_dump(dump_dir)
+        enable_io_dump(dump_dir, summary_only=False)
         reset_exec_order()
         t = torch.zeros(2)
 
@@ -968,7 +976,7 @@ class TestRankInDumper:
 
     def test_dump_creates_rank_directory(self, dump_dir):
         reset_rank()
-        enable_io_dump(dump_dir)
+        enable_io_dump(dump_dir, summary_only=False)
         reset_exec_order()
         t = torch.zeros(2)
         dump_before("test_op", (t,), {})
@@ -979,7 +987,7 @@ class TestRankInDumper:
     @patch.dict(os.environ, {"RANK": "3"}, clear=False)
     def test_dump_rank_nonzero(self, dump_dir):
         reset_rank()
-        enable_io_dump(dump_dir)
+        enable_io_dump(dump_dir, summary_only=False)
         reset_exec_order()
         t = torch.zeros(2)
         dump_before("test_op", (t,), {})
@@ -991,7 +999,7 @@ class TestRankInDumper:
 
     def test_dump_metadata_has_rank(self, dump_dir):
         reset_rank()
-        enable_io_dump(dump_dir)
+        enable_io_dump(dump_dir, summary_only=False)
         reset_exec_order()
         t = torch.zeros(2)
         dump_before("test_op", (t,), {})
@@ -1004,7 +1012,7 @@ class TestRankInDumper:
 
     def test_output_metadata_has_rank(self, dump_dir):
         reset_rank()
-        enable_io_dump(dump_dir)
+        enable_io_dump(dump_dir, summary_only=False)
         reset_exec_order()
         t = torch.zeros(2)
         dump_before("test_op", (t,), {})
@@ -1046,7 +1054,7 @@ class TestRankFilterInDumper:
 
     def test_rank_filter_allows_matching(self, dump_dir):
         reset_rank()  # rank 0
-        enable_io_dump(dump_dir, ranks={0})
+        enable_io_dump(dump_dir, ranks={0}, summary_only=False)
         reset_exec_order()
         t = torch.zeros(2)
         dump_before("test_op", (t,), {})
@@ -1181,7 +1189,7 @@ class TestMetaOnly:
 
     def test_meta_only_creates_json_only(self, dump_dir):
         """meta_only=True should create .json but not .pt files."""
-        enable_io_dump(dump_dir, meta_only=True)
+        enable_io_dump(dump_dir, meta_only=True, summary_only=False)
         reset_exec_order()
         t = torch.zeros(2, 3)
         dump_before("test_op", (t,), {})
@@ -1198,7 +1206,7 @@ class TestMetaOnly:
 
     def test_meta_only_json_has_tensor_stats(self, dump_dir):
         """meta_only JSON should still have tensor stats via 'tensors' key."""
-        enable_io_dump(dump_dir, meta_only=True)
+        enable_io_dump(dump_dir, meta_only=True, summary_only=False)
         reset_exec_order()
         t = torch.randn(4, 5)
         dump_before("test_op", (t,), {})
@@ -1213,7 +1221,7 @@ class TestMetaOnly:
 
     def test_meta_only_false_creates_pt(self, dump_dir):
         """Explicit meta_only=False should create .pt files."""
-        enable_io_dump(dump_dir, meta_only=False)
+        enable_io_dump(dump_dir, meta_only=False, summary_only=False)
         reset_exec_order()
         t = torch.zeros(2)
         dump_before("test_op", (t,), {})
@@ -1592,11 +1600,8 @@ class TestSummaryJson:
             summary = json.load(f)
         assert "flaggems_ops" in summary
         assert "non_flaggems_ops" in summary
-        assert "triton_ops" in summary
-        assert "non_triton_ops" in summary
-        # test_op has no dispatch_keys → non-FlagGems, non-Triton
+        # test_op has no dispatch_keys → non-FlagGems
         assert "test_op" in summary["non_flaggems_ops"]
-        assert "test_op" in summary["non_triton_ops"]
 
     def test_summary_empty_when_no_ops(self, dump_dir):
         """No summary.json when no ops were dumped."""
@@ -1607,7 +1612,7 @@ class TestSummaryJson:
         assert not os.path.exists(summary_path)
 
     def test_summary_flaggems_classification(self, dump_dir):
-        """Ops with FlagGems dispatch keys go into flaggems_ops and triton_ops."""
+        """Ops with FlagGems dispatch keys go into flaggems_ops."""
         from vllm_fl.dispatch.io_dumper import _lock, _op_summary
 
         enable_io_dump(dump_dir=dump_dir)
@@ -1615,12 +1620,10 @@ class TestSummaryJson:
         with _lock:
             _op_summary["aten.mm"] = {
                 "dispatch_keys": "[(CUDA, FlagGems, False)]",
-                "is_triton": True,
                 "call_count": 5,
             }
             _op_summary["aten.add"] = {
                 "dispatch_keys": "[(CPU, CPU, False)]",
-                "is_triton": False,
                 "call_count": 3,
             }
         disable_io_dump()
@@ -1632,10 +1635,6 @@ class TestSummaryJson:
         assert "aten.mm" in summary["flaggems_ops"]
         assert "aten.add" in summary["non_flaggems_ops"]
         assert "aten.mm" not in summary["non_flaggems_ops"]
-        # FlagGems ops are also Triton ops
-        assert "aten.mm" in summary["triton_ops"]
-        assert "aten.add" in summary["non_triton_ops"]
-        assert "aten.mm" not in summary["non_triton_ops"]
 
     def test_summary_multiple_ops(self, dump_dir):
         """Multiple ops are collected across calls."""
@@ -1655,6 +1654,109 @@ class TestSummaryJson:
         non_fg = summary["non_flaggems_ops"]
         assert "op_a" in non_fg
         assert "op_b" in non_fg
-        non_tr = summary["non_triton_ops"]
-        assert "op_a" in non_tr
-        assert "op_b" in non_tr
+
+
+class TestSummaryOnly:
+    """Tests for summary_only mode."""
+
+    def setup_method(self):
+        reset_exec_order()
+        reset_step()
+        reset_rank()
+
+    def teardown_method(self):
+        disable_io_dump()
+
+    def test_summary_only_writes_summary(self, dump_dir):
+        """summary_only=True still writes summary.json."""
+        enable_io_dump(dump_dir=dump_dir, summary_only=True)
+        t = torch.zeros(2)
+        dump_before("test_op", (t,), {})
+        dump_after("test_op", (t,), t)
+        disable_io_dump()
+
+        summary_path = os.path.join(dump_dir, "rank_0000", "summary.json")
+        assert os.path.isfile(summary_path)
+        with open(summary_path) as f:
+            summary = json.load(f)
+        assert "test_op" in summary["non_flaggems_ops"]
+
+    def test_summary_only_no_per_op_dirs(self, dump_dir):
+        """summary_only=True does NOT create per-op directories."""
+        enable_io_dump(dump_dir=dump_dir, summary_only=True)
+        # Run ops through dispatch mode
+        t = torch.zeros(2)
+        _ = t + t  # triggers dispatch mode
+        disable_io_dump()
+
+        rank_dir = os.path.join(dump_dir, "rank_0000")
+        if os.path.isdir(rank_dir):
+            # Only summary.json should exist, no step_XXXX dirs
+            contents = os.listdir(rank_dir)
+            step_dirs = [d for d in contents if d.startswith("step_")]
+            assert step_dirs == [], f"Expected no step dirs, found: {step_dirs}"
+
+    def test_summary_only_env_var(self, dump_dir):
+        """VLLM_FL_IO_DUMP_SUMMARY_ONLY=1 enables summary_only mode."""
+        with patch.dict(
+            os.environ,
+            {
+                "VLLM_FL_IO_DUMP": dump_dir,
+                "VLLM_FL_IO_DUMP_SUMMARY_ONLY": "1",
+            },
+        ):
+            from vllm_fl.dispatch.io_dumper import _init_from_env
+
+            _init_from_env()
+            from vllm_fl.dispatch import io_dumper
+
+            assert io_dumper._summary_only is True
+        disable_io_dump()
+
+    def test_summary_only_shared_env_var(self, dump_dir):
+        """VLLM_FL_IO_SUMMARY_ONLY=1 enables summary_only via shared fallback."""
+        with patch.dict(
+            os.environ,
+            {
+                "VLLM_FL_IO_DUMP": dump_dir,
+                "VLLM_FL_IO_SUMMARY_ONLY": "1",
+            },
+        ):
+            from vllm_fl.dispatch.io_dumper import _init_from_env
+
+            _init_from_env()
+            from vllm_fl.dispatch import io_dumper
+
+            assert io_dumper._summary_only is True
+        disable_io_dump()
+
+
+class TestJsonMergedWrite:
+    """Tests for merged JSON write (multiple calls to same op)."""
+
+    def setup_method(self):
+        reset_exec_order()
+        reset_step()
+        reset_rank()
+
+    def teardown_method(self):
+        disable_io_dump()
+
+    def test_buffer_produces_correct_merged_output(self, dump_dir):
+        """Multiple buffered writes produce correct merged JSON."""
+        enable_io_dump(dump_dir=dump_dir, meta_only=False, summary_only=False)
+        t = torch.zeros(2)
+        # Multiple calls to the same op
+        dump_before("test_op", (t,), {})
+        dump_after("test_op", (t,), t)
+        dump_before("test_op", (t,), {})
+        dump_after("test_op", (t,), t)
+        disable_io_dump()
+
+        step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
+        input_json = os.path.join(step_dir, "input.json")
+        assert os.path.isfile(input_json)
+        with open(input_json) as f:
+            data = json.load(f)
+        assert "call_1" in data
+        assert "call_2" in data

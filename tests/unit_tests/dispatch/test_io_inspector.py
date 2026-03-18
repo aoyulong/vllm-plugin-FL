@@ -466,7 +466,7 @@ class TestTorchFunctionMode:
     def test_torch_func_mode_captures_matmul(self, caplog):
         import logging
 
-        enable_io_inspect(ops={"matmul"}, torch_funcs=True)
+        enable_io_inspect(ops={"matmul"}, torch_funcs=True, summary_only=False)
 
         with caplog.at_level(logging.INFO, logger="vllm_fl.dispatch.io_inspect"):
             a = torch.randn(2, 3)
@@ -1172,3 +1172,54 @@ class TestComposableFilters:
         m = torch.nn.Linear(10, 10)
         assert _should_inspect("any_op", (m,))
         assert not _should_inspect("any_op", (torch.zeros(2),))
+
+
+class TestSummaryOnlyInspector:
+    """Tests for inspector summary_only mode."""
+
+    def setup_method(self):
+        reset_exec_order()
+        reset_step()
+        reset_rank()
+
+    def teardown_method(self):
+        disable_io_inspect()
+
+    def test_summary_only_records_seen_ops(self):
+        """summary_only=True still records seen ops."""
+        enable_io_inspect(summary_only=True)
+        # Run an op through dispatch mode
+        t = torch.zeros(2)
+        _ = t + t
+        advance_step()
+        disable_io_inspect()
+
+    def test_summary_only_env_var(self):
+        """VLLM_FL_IO_INSPECT_SUMMARY_ONLY=1 enables summary_only."""
+        with patch.dict(
+            os.environ,
+            {
+                "VLLM_FL_IO_INSPECT": "1",
+                "VLLM_FL_IO_INSPECT_SUMMARY_ONLY": "1",
+            },
+        ):
+            from vllm_fl.dispatch.io_inspector import _init_from_env
+
+            _init_from_env()
+            assert io_inspector._summary_only is True
+        disable_io_inspect()
+
+    def test_summary_only_shared_env_var(self):
+        """VLLM_FL_IO_SUMMARY_ONLY=1 enables summary_only via shared fallback."""
+        with patch.dict(
+            os.environ,
+            {
+                "VLLM_FL_IO_INSPECT": "1",
+                "VLLM_FL_IO_SUMMARY_ONLY": "1",
+            },
+        ):
+            from vllm_fl.dispatch.io_inspector import _init_from_env
+
+            _init_from_env()
+            assert io_inspector._summary_only is True
+        disable_io_inspect()

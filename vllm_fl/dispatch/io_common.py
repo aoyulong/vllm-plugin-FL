@@ -11,6 +11,7 @@ parsing used by both io_inspector.py and io_dumper.py.
 from __future__ import annotations
 
 import fnmatch
+import functools
 import inspect
 import logging
 import os
@@ -38,6 +39,55 @@ try:
 except ImportError:
     TorchDispatchMode = None  # type: ignore[misc,assignment]
     HAS_TORCH_DISPATCH_MODE = False
+
+
+_io_active: bool = False
+
+
+def set_io_active(active: bool) -> None:
+    """Mark whether IO inspect/dump is enabled.
+
+    Called by io_inspector/io_dumper ``enable_*`` and ``_init_from_env()``
+    so that ``managed_inference_mode`` skips ``torch.inference_mode``
+    during IO capture.  Also called on ``disable_*`` to restore normal
+    behaviour.
+    """
+    global _io_active
+    _io_active = active
+
+
+def is_io_active() -> bool:
+    """Return True if IO inspect or dump is currently enabled."""
+    return _io_active
+
+
+def managed_inference_mode():
+    """Drop-in replacement for ``@torch.inference_mode()``.
+
+    When IO dispatch modes are enabled, downgrades to ``torch.no_grad()``
+    so that CompositeImplicitAutograd ops (e.g. ``aten.linear``) decompose
+    into leaf ops (``aten.mm``, ``aten.t``) visible to TorchDispatchMode.
+
+    ``torch.no_grad()`` (vs removing inference mode entirely) is critical:
+    it prevents autograd from building computation graphs for every op,
+    which would otherwise exhaust GPU memory and cause segfaults.
+
+    When IO is not enabled, behaves identically to
+    ``@torch.inference_mode()``.
+    """
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if _io_active:
+                with torch.no_grad():
+                    return fn(*args, **kwargs)
+            with torch.inference_mode():
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 _eager_mode_override: Optional[bool] = None
@@ -672,22 +722,6 @@ def should_inspect_torch_func(
 
 # ── Dispatch op filtering (TorchDispatchMode) ──
 
-SKIP_DISPATCH_OPS = frozenset({
-    # Memory/allocation ops
-    "empty", "empty_like", "empty_strided", "zeros", "zeros_like",
-    "ones", "ones_like", "full", "full_like",
-    # View/metadata ops
-    "detach", "lift_fresh", "lift_fresh_copy",
-    "t", "transpose", "expand", "view", "reshape", "contiguous",
-    "slice", "select", "unsqueeze", "squeeze",
-    "_unsafe_view", "as_strided",
-    # Copy/conversion
-    "copy_", "to", "_to_copy",
-    # Size/shape queries (non-tensor returns)
-    "sym_size", "sym_stride", "sym_numel",
-})
-
-
 def get_dispatch_op_name(func) -> str:
     """Extract short name from an ATen OpOverload.
 
@@ -733,10 +767,6 @@ _THIRD_PARTY_BACKENDS = {
     "flag_gems": "FlagGems",
     "triton": "Triton",
 }
-
-# Backends known to be Triton-based (used for is_triton classification)
-_TRITON_BACKENDS = {"FlagGems", "Triton"}
-
 
 def _infer_backend_from_path(reg_path: str) -> str:
     """Infer the backend name from a kernel registration path.
@@ -840,169 +870,6 @@ def get_dispatch_keys(
     return entries
 
 
-# Cache for is_triton_op results: op_name -> bool.
-# Cleared on step advance so runtime changes (e.g. backend switch) are picked up.
-_triton_op_cache: Dict[str, bool] = {}
-
-
-def _is_triton_from_dispatch_keys(
-    dispatch_keys: List[Tuple[str, str, bool]],
-) -> bool:
-    """Check dispatch key registrations for Triton-based backends."""
-    return any(
-        impl in _TRITON_BACKENDS
-        for _key, impl, is_default in dispatch_keys
-        if not is_default
-    )
-
-
-def _is_triton_from_op_manager(op_name: str) -> bool:
-    """Check if OpManager resolved this op to a flagos (FlagGems/Triton) backend."""
-    try:
-        from .manager import get_default_manager
-        from .types import BackendImplKind
-        mgr = get_default_manager()
-        # Check the actually-called implementation first
-        impl_id = mgr._called_ops.get(op_name)
-        if impl_id:
-            snap = mgr._registry.snapshot()
-            for imp in snap.impls_by_op.get(op_name, []):
-                if imp.impl_id == impl_id:
-                    return imp.kind == BackendImplKind.DEFAULT
-    except Exception:
-        pass
-    return False
-
-
-# Triton kernel launch indicators.
-# - cuLaunchKernelEx: CUDA driver API used by FlagGems / user Triton kernels
-#   (native CUDA ops use cudaLaunchKernel instead).
-# - triton_: torch.compile/inductor names its generated kernels with this prefix
-#   (e.g. triton_poi_fused_add_mul_0, triton_red_fused_1).
-# New backends may add their own launch API names here.
-_TRITON_LAUNCH_EVENTS = {"cuLaunchKernelEx"}
-_TRITON_KERNEL_PREFIX = "triton_"
-
-
-def _get_profiler_activities():
-    """Return ``[CPU, <device>]`` profiler activities for the current accelerator.
-
-    Uses ``torch.accelerator.current_accelerator()`` to pick the right
-    device activity (CUDA, XPU, HPU, …) so the profiler check works on
-    any backend that has Triton support.  Falls back to CPU-only if no
-    accelerator is available.
-    """
-    from torch.profiler import ProfilerActivity
-    activities = [ProfilerActivity.CPU]
-    try:
-        accel = str(torch.accelerator.current_accelerator()).upper()
-        device_activity = getattr(ProfilerActivity, accel, None)
-        if device_activity is not None:
-            activities.append(device_activity)
-    except Exception:
-        pass
-    return activities
-
-
-def _is_triton_from_profiler(
-    func,
-    args: tuple = (),
-    kwargs: Optional[dict] = None,
-) -> bool:
-    """Run the op once under ``torch.profiler`` and inspect profiler events.
-
-    Detects Triton kernels by two device-agnostic signals (~3-4 ms overhead):
-
-    1. **Launch event**: Triton kernels are launched via ``cuLaunchKernelEx``
-       (CUDA) or an equivalent driver API, while native vendor libraries
-       (cuBLAS, oneDNN, …) use ``cudaLaunchKernel`` / similar.
-    2. **Kernel name prefix**: ``torch.compile``/inductor names its generated
-       Triton kernels ``triton_poi_*``, ``triton_red_*``, etc.
-
-    The profiler activities are chosen automatically based on
-    ``torch.accelerator.current_accelerator()`` so this works on CUDA, XPU,
-    HPU, or any backend with Triton support.
-
-    Only called when the fast static checks (dispatch table, OpManager) are
-    inconclusive.  Results are cached per op name so each op is profiled at
-    most once.
-    """
-    try:
-        from torch.profiler import profile
-        kwargs = kwargs or {}
-        activities = _get_profiler_activities()
-        with profile(activities=activities) as prof:
-            func(*args, **kwargs)
-            try:
-                torch.accelerator.synchronize()
-            except Exception:
-                pass
-
-        for evt in prof.events():
-            name = evt.name
-            # Signal 1: Triton-specific kernel launch API
-            if name in _TRITON_LAUNCH_EVENTS:
-                return True
-            # Signal 2: inductor-generated triton kernel name
-            if name.startswith(_TRITON_KERNEL_PREFIX):
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def is_triton_op(
-    op_name: str = "",
-    dispatch_keys: Optional[List[Tuple[str, str, bool]]] = None,
-    func=None,
-    args: tuple = (),
-    kwargs: Optional[dict] = None,
-) -> bool:
-    """Check if an op is backed by a Triton kernel.
-
-    Uses a layered detection strategy (cheapest first, cached per op):
-
-    1. **Dispatch table** (static, ~0 cost): check if any non-default
-       dispatch key implementation is from a known Triton-based backend
-       (FlagGems, Triton, or anything in ``_TRITON_BACKENDS``).
-       Works in both eager and compile modes because the dispatch table
-       is static kernel registration metadata.
-
-    2. **OpManager registry** (static, ~0 cost): check if the resolved
-       implementation has ``kind == BackendImplKind.DEFAULT`` (flagos),
-       which means FlagGems / Triton.  Covers Python-level dispatch.
-
-    3. **Profiler** (runtime, ~3-4 ms — only when *func* is provided
-       and the static checks are inconclusive): run the op once under
-       ``torch.profiler`` and inspect events for ``cuLaunchKernelEx``
-       (FlagGems / user Triton kernels) or ``triton_`` kernel name
-       prefix (torch.compile / inductor).
-
-    Results are cached per ``op_name`` so each op is profiled at most once.
-    """
-    # Fast path: check cache
-    if op_name and op_name in _triton_op_cache:
-        return _triton_op_cache[op_name]
-
-    result = False
-
-    # Strategy 1: dispatch key registrations
-    if dispatch_keys and _is_triton_from_dispatch_keys(dispatch_keys):
-        result = True
-
-    # Strategy 2: OpManager registry
-    if not result and op_name and _is_triton_from_op_manager(op_name):
-        result = True
-
-    # Strategy 3: profiler (expensive, only when func is provided)
-    if not result and func is not None:
-        result = _is_triton_from_profiler(func, args, kwargs)
-
-    # Cache the result
-    if op_name:
-        _triton_op_cache[op_name] = result
-    return result
-
 
 def should_inspect_dispatch_op(
     op_name: str,
@@ -1016,8 +883,6 @@ def should_inspect_dispatch_op(
         match_all: Whether all ops are being captured.
         op_filter: Specific op names to match (empty means all).
     """
-    if op_name in SKIP_DISPATCH_OPS:
-        return False
     if op_filter and op_name not in op_filter:
         return False
     return True
@@ -1288,6 +1153,40 @@ def make_module_tag() -> str:
     return ""
 
 
+def make_module_tag_from_ctx(
+    mod_name: str, mod_path: str,
+    for_json: bool = False,
+) -> str:
+    """Build a module tag from stack-derived module context.
+
+    Args:
+        mod_name: Module class name (e.g. ``"Linear"``).
+        mod_path: Full dotted path (e.g. ``"model.layers.0.self_attn.q_proj"``).
+        for_json: If True, return bare ``"ClassName:path"`` for JSON fields.
+            If False, return ``"[ClassName:path]"`` for log display.
+
+    Returns:
+        Empty string if *mod_name* is empty.
+
+    Examples::
+
+        make_module_tag_from_ctx("Linear", "model.layers.0.self_attn.q_proj", for_json=True)
+        # => "Linear:model.layers.0.self_attn.q_proj"
+
+        make_module_tag_from_ctx("Linear", "model.layers.0.self_attn.q_proj")
+        # => "[Linear:model.layers.0.self_attn.q_proj]"
+
+        make_module_tag_from_ctx("Linear", "")
+        # => "[Linear]" or "Linear"
+    """
+    if not mod_name:
+        return ""
+    tag = f"{mod_name}:{mod_path}" if mod_path else mod_name
+    if for_json:
+        return tag
+    return f"[{tag}]"
+
+
 def make_op_tag(op_name: str) -> str:
     """Build ``[op=X,Y]``, incrementing the per-step op counter."""
     idx, count = next_op_counter(op_name)
@@ -1305,7 +1204,7 @@ def make_label(
 
     Example output::
 
-        mm (module=Linear, layer=model.layers.0, is_triton=True, dispatch_keys=[(CUDA, FlagGems), (CPU, CPU)])
+        mm (module=Linear, layer=model.layers.0, dispatch_keys=[(CUDA, FlagGems), (CPU, CPU)])
 
     Args:
         op_name: Operator name.
@@ -1322,7 +1221,6 @@ def make_label(
     parts = [f"module={module_name or ''}"]
     if layer_path:
         parts.append(f"layer={layer_path}")
-    parts.append(f"is_triton={is_triton_op(op_name, dispatch_keys)}")
     if dispatch_keys is not None:
         dk_items = [f"({k}, {impl})" for k, impl, _default in dispatch_keys]
         parts.append(f"dispatch_keys=[{', '.join(dk_items)}]")
@@ -1505,6 +1403,8 @@ def _parse_inspect_section(cfg: Dict[str, Any]) -> Dict[str, Any]:
     if "torch_funcs" in cfg:
         parsed["torch_funcs"] = _parse_torch_funcs_yaml(cfg["torch_funcs"])
     parsed["ranks"] = _parse_ranks_yaml(cfg.get("ranks"))
+    if "summary_only" in cfg:
+        parsed["summary_only"] = bool(cfg["summary_only"])
 
     return parsed
 
@@ -1534,6 +1434,8 @@ def _parse_dump_section(cfg: Dict[str, Any]) -> Dict[str, Any]:
         parsed["torch_funcs"] = _parse_torch_funcs_yaml(cfg["torch_funcs"])
     parsed["ranks"] = _parse_ranks_yaml(cfg.get("ranks"))
     parsed["meta_only"] = bool(cfg.get("meta_only", True))
+    if "summary_only" in cfg:
+        parsed["summary_only"] = bool(cfg["summary_only"])
 
     return parsed
 

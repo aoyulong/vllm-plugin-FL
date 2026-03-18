@@ -68,6 +68,7 @@ import vllm_fl.envs as fl_envs
 
 from vllm_fl.utils import get_flag_gems_whitelist_blacklist
 from vllm_fl.ops.custom_ops import register_oot_ops
+from vllm_fl.dispatch.io_common import managed_inference_mode
 
 logger = init_logger(__name__)
 
@@ -705,13 +706,13 @@ class WorkerFL(WorkerBase):
             f"execute_new_{num_new}_cached_{num_cached}"
         )
 
-    @torch.inference_mode()
+    @managed_inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)
 
-    @torch.inference_mode()
+    @managed_inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",

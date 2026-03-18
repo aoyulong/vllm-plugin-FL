@@ -214,6 +214,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 from vllm_fl.compilation.graph import GraphWrapper
+from vllm_fl.dispatch.io_common import managed_inference_mode
 
 
 logger = init_logger(__name__)
@@ -2983,7 +2984,7 @@ class ModelRunnerFL(
                 pyt_hooks.register_hooks(self.model, self.model.__class__.__name__)
                 self.layerwise_nvtx_hooks_registered = True
 
-    @torch.inference_mode()
+    @managed_inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3245,13 +3246,9 @@ class ModelRunnerFL(
         )
         self.kv_connector_output = kv_connector_output
 
-        # Advance IO step after the forward pass completes so that
-        # step 0 = first forward, step 1 = second forward, etc.
-        _maybe_advance_io_step()
-
         return None
 
-    @torch.inference_mode
+    @managed_inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
@@ -3400,6 +3397,10 @@ class ModelRunnerFL(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
             )
+
+        # Advance IO step after the full inference cycle (forward + sampling)
+        # so that one step encompasses both execute_model and sample_tokens.
+        _maybe_advance_io_step()
 
         ### TODO(lms): abstract async schedule for all hardware
         if not self.use_async_scheduling:
@@ -3661,6 +3662,26 @@ class ModelRunnerFL(
         if self.parallel_config.enable_eplb:
             self.eplb_state = EplbState(self.parallel_config, self.device)
             eplb_models = 0
+
+        # Initialize and activate IO dispatch modes BEFORE model loading so
+        # that init-time ops (cos, sin, arange, pow, reciprocal, cat, zeros,
+        # ones, etc. from rotary_embedding.__init__ and buffer creation) are
+        # captured.  register_module_paths / set_eager_mode are called after
+        # loading since they need the model object, but the dispatch mode
+        # itself works without them.
+        _io_env_prefixes = ("VLLM_FL_IO_INSPECT", "VLLM_FL_IO_DUMP",
+                            "VLLM_FL_IO_STEP_RANGE", "VLLM_FL_IO_LAYERS",
+                            "VLLM_FL_IO_RANK")
+        _io_requested = any(
+            k.startswith(_io_env_prefixes) for k in os.environ
+        ) or os.environ.get("VLLM_FL_CONFIG", "").strip()
+        if _io_requested:
+            from vllm_fl.dispatch.io_inspector import _init_from_env as _init_inspect
+            from vllm_fl.dispatch.io_dumper import _init_from_env as _init_dump
+            _init_inspect()
+            _init_dump()
+            _maybe_activate_io_hooks()
+
         try:
             with DeviceMemoryProfiler() as m:
                 time_before_load = time.perf_counter()
@@ -3761,20 +3782,6 @@ class ModelRunnerFL(
         # Tell the IO system whether torch.compile will be used so it can
         # skip TorchFunctionMode (incompatible with torch.compile).
         set_eager_mode(getattr(self.model_config, "enforce_eager", False))
-        # Initialize IO inspector/dumper from env vars or YAML config.
-        # This must happen AFTER set_eager_mode() so _activate_hooks() knows
-        # whether to enable TorchFunctionMode (eager-only, opt-in).
-        _io_env_prefixes = ("VLLM_FL_IO_INSPECT", "VLLM_FL_IO_DUMP",
-                            "VLLM_FL_IO_STEP_RANGE", "VLLM_FL_IO_LAYERS",
-                            "VLLM_FL_IO_RANK")
-        _io_requested = any(
-            k.startswith(_io_env_prefixes) for k in os.environ
-        ) or os.environ.get("VLLM_FL_CONFIG", "").strip()
-        if _io_requested:
-            from vllm_fl.dispatch.io_inspector import _init_from_env as _init_inspect
-            from vllm_fl.dispatch.io_dumper import _init_from_env as _init_dump
-            _init_inspect()
-            _init_dump()
 
         prepare_communication_buffer_for_model(self.model)
         if (drafter := getattr(self, "drafter", None)) and (
