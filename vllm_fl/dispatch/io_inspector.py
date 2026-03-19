@@ -97,9 +97,6 @@ from .io_common import (
     expand_layer_specs,
     format_result,
     format_value,
-    get_current_module,
-    get_current_module_path,
-    get_dispatch_keys,
     get_dispatch_op_name,
     get_dispatch_op_namespace,
     get_module_class_name,
@@ -111,7 +108,6 @@ from .io_common import (
     layer_path_matches_from_stack,
     make_guard,
     make_label,
-    make_module_tag_from_ctx,
     make_op_tag,
     module_context_matches,
     module_context_matches_from_stack,
@@ -269,7 +265,6 @@ def _format_inputs(args: tuple, kwargs: dict,
 
 
 def _log_combined(label: str, input_lines: List[str], result: Any,
-                  module_tag: str = "",
                   op_tag: str = "",
                   exec_order: int = 0) -> None:
     """Log a consolidated INPUTS + OUTPUTS block for an op call."""
@@ -278,7 +273,7 @@ def _log_combined(label: str, input_lines: List[str], result: Any,
     sep = "-" * 60
     parts = [
         f"\n{sep}",
-        f"[IO_INSPECT][rank={rank}][step={step}][exec_order={exec_order}]{module_tag}{op_tag} {label}",
+        f"[IO_INSPECT][rank={rank}][step={step}][exec_order={exec_order}]{op_tag} {label}",
         f"{sep}",
         "  INPUTS:",
     ]
@@ -290,13 +285,12 @@ def _log_combined(label: str, input_lines: List[str], result: Any,
 
 
 def _log_outputs_only(label: str, result: Any,
-                      module_tag: str = "",
                       op_tag: str = "",
                       exec_order: int = 0) -> None:
     """Log operator/module outputs only (fallback when no pairing)."""
     rank = get_rank()
     step = get_step()
-    logger.info(f"[IO_INSPECT][rank={rank}][step={step}][exec_order={exec_order}]{module_tag}{op_tag} {label} OUTPUTS:\n{format_result(result)}")
+    logger.info(f"[IO_INSPECT][rank={rank}][step={step}][exec_order={exec_order}]{op_tag} {label} OUTPUTS:\n{format_result(result)}")
 
 
 # ── Public API ──
@@ -321,8 +315,8 @@ def inspect_before(op_name: str, args: tuple, kwargs: dict,
             ``_call_with_hooks`` a single order is shared with the dumper so
             that log lines and dump files can be correlated.  If *None*, an
             order is allocated internally (standalone usage).
-        module_tag: Pre-computed module counter tag (e.g. ``[module=0,1]``).
-            When *None*, generated internally.
+        module_tag: Accepted for API compatibility with OpManager but not
+            used by the inspector (module info is included in the label).
         op_tag: Pre-computed op counter tag (e.g. ``[op=3,2]``).
             When *None*, generated internally.
     """
@@ -334,13 +328,6 @@ def inspect_before(op_name: str, args: tuple, kwargs: dict,
         return
     order = exec_order if exec_order is not None else next_exec_order()
     label = make_label(f"Op '{op_name}'", args)
-    if module_tag is not None:
-        _module_tag = module_tag
-    else:
-        # Build structured module_tag from current hook context
-        mod_name = get_module_class_name(args) or get_current_module() or ""
-        mod_path = get_current_module_path()
-        _module_tag = make_module_tag_from_ctx(mod_name, mod_path)
     _op_tag = op_tag if op_tag is not None else make_op_tag(op_name)
     record_seen(op_name, args)
     set_guard(True)
@@ -353,7 +340,7 @@ def inspect_before(op_name: str, args: tuple, kwargs: dict,
     if stack is None:
         _inspect_pairing.stack = {}
         stack = _inspect_pairing.stack
-    stack.setdefault(op_name, []).append((label, order, input_lines, _module_tag, _op_tag))
+    stack.setdefault(op_name, []).append((label, order, input_lines, _op_tag))
 
 
 def inspect_after(op_name: str, args: tuple, result: Any) -> None:
@@ -378,18 +365,14 @@ def inspect_after(op_name: str, args: tuple, result: Any) -> None:
     set_guard(True)
     try:
         if pairing:
-            label, order, input_lines, module_tag, op_tag = pairing
+            label, order, input_lines, op_tag = pairing
             _log_combined(label, input_lines, result,
-                          module_tag=module_tag, op_tag=op_tag,
-                          exec_order=order)
+                          op_tag=op_tag, exec_order=order)
         else:
             # Fallback: no pairing (shouldn't happen normally)
-            mod_name = get_module_class_name(args) or get_current_module() or ""
-            mod_path = get_current_module_path()
-            module_tag = make_module_tag_from_ctx(mod_name, mod_path)
             op_tag = make_op_tag(op_name)
             _log_outputs_only(make_label(f"Op '{op_name}'", args), result,
-                              module_tag=module_tag, op_tag=op_tag)
+                              op_tag=op_tag)
     finally:
         set_guard(False)
 
@@ -695,12 +678,9 @@ if HAS_TORCH_DISPATCH_MODE:
 
             ns = get_dispatch_op_namespace(func)
             full_name = f"{ns}.{op_name}"
-            dispatch_keys = get_dispatch_keys(func, args, kwargs)
             label = make_label(full_name, module_name=mod_name or None,
-                               layer_path=mod_path or None,
-                               dispatch_keys=dispatch_keys)
+                               layer_path=mod_path or None)
             order = next_exec_order()
-            module_tag = make_module_tag_from_ctx(mod_name, mod_path)
             op_tag = make_op_tag(full_name)
             record_seen(full_name, module_name=mod_name or None)
 
@@ -715,7 +695,6 @@ if HAS_TORCH_DISPATCH_MODE:
             set_guard(True)
             try:
                 _log_combined(label, input_lines, result,
-                              module_tag=module_tag,
                               op_tag=op_tag, exec_order=order)
             finally:
                 set_guard(False)
@@ -755,8 +734,7 @@ if HAS_TORCH_FUNC_MODE:
             mod_path = module_ctx[0][1] if module_ctx else ""
             label = make_label(full_name, module_name=mod_name or None,
                                layer_path=mod_path or None)
-            module_tag = make_module_tag_from_ctx(mod_name, mod_path)
-            _mt, op_tag, order = acquire_torch_func_tags(full_name)
+            _, op_tag, order = acquire_torch_func_tags(full_name)
             record_seen(full_name, module_name=mod_name or None)
             set_guard(True)
             try:
@@ -772,7 +750,6 @@ if HAS_TORCH_FUNC_MODE:
             set_guard(True)
             try:
                 _log_combined(label, input_lines, result,
-                              module_tag=module_tag,
                               op_tag=op_tag, exec_order=order)
             finally:
                 set_guard(False)

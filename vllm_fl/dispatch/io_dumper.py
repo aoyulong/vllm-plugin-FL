@@ -482,7 +482,7 @@ def _dump_input(op_name: str, args: tuple, kwargs: dict,
         op_name: Raw op name, used as pairing key.
         exec_order: Pre-allocated execution order.  *None* → allocate internally.
         label: Display label (may include module info) for metadata.
-        module_tag: Module counter tag string, e.g. ``[module=0,1]``.
+        module_tag: Structured module tag, e.g. ``"Linear:model.layers.0.self_attn.q_proj"``.
         op_tag: Op counter tag string, e.g. ``[op=3,2]``.
         dispatch_keys: Full list of ``(key, impl, is_default)`` triples.
     """
@@ -574,8 +574,8 @@ def dump_before(op_name: str, args: tuple, kwargs: dict,
 
     Args:
         exec_order: Pre-allocated execution order shared with the inspector.
-        module_tag: Pre-computed module counter tag (e.g. ``[module=0,1]``).
-            When *None*, generated internally.
+        module_tag: Accepted for API compatibility with OpManager but not
+            used — structured module tag is always built from hook context.
         op_tag: Pre-computed op counter tag (e.g. ``[op=3,2]``).
             When *None*, generated internally.
     """
@@ -593,13 +593,10 @@ def dump_before(op_name: str, args: tuple, kwargs: dict,
         return
 
     label = make_label(op_name, args)
-    if module_tag is not None:
-        _module_tag = module_tag
-    else:
-        # Build structured module_tag from current hook context
-        mod_name = get_module_class_name(args) or get_current_module() or ""
-        mod_path = get_current_module_path()
-        _module_tag = make_module_tag_from_ctx(mod_name, mod_path, for_json=True)
+    # Always build structured module_tag from current hook context
+    mod_name = get_module_class_name(args) or get_current_module() or ""
+    mod_path = get_current_module_path()
+    _module_tag = make_module_tag_from_ctx(mod_name, mod_path, for_json=True)
     _op_tag = op_tag if op_tag is not None else make_op_tag(op_name)
     record_seen(op_name, args)
     set_guard(True)
@@ -1165,7 +1162,7 @@ if HAS_TORCH_FUNC_MODE:
             mod_path = module_ctx[0][1] if module_ctx else ""
             label = make_label(raw_name, module_name=mod_name or None,
                                layer_path=mod_path or None)
-            _mt, op_tag, order = acquire_torch_func_tags(raw_name)
+            _, op_tag, order = acquire_torch_func_tags(raw_name)
             record_seen(raw_name, module_name=mod_name or None)
 
             set_guard(True)
