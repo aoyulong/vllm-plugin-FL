@@ -215,6 +215,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 from vllm_fl.compilation.graph import GraphWrapper
+from vllm_fl.dispatch.io_common import managed_inference_mode
 
 logger = init_logger(__name__)
 
@@ -224,6 +225,28 @@ logger = init_logger(__name__)
 _io_advance_step = None
 _io_inspect_enabled = None
 _io_dump_enabled = None
+_io_hooks_activated = False
+
+
+def _maybe_activate_io_hooks() -> None:
+    """Activate IO dispatch modes if not yet done (once per process).
+
+    ``_init_from_env()`` parses config and sets ``_enabled = True`` during
+    ``load_model()``, but defers dispatch mode activation so that the
+    modes don't interfere with vLLM's ``determine_available_memory()``.
+    This function enters the modes just before the first ``execute_model()``.
+    """
+    global _io_hooks_activated
+    if _io_hooks_activated:
+        return
+    _io_hooks_activated = True
+    try:
+        from vllm_fl.dispatch.io_inspector import maybe_activate_hooks as _act_inspect
+        from vllm_fl.dispatch.io_dumper import maybe_activate_hooks as _act_dump
+        _act_inspect()
+        _act_dump()
+    except Exception as exc:
+        logger.warning("Failed to activate IO hooks: %s", exc)
 
 
 def _maybe_advance_io_step() -> None:
@@ -2958,12 +2981,16 @@ class ModelRunnerFL(
                 pyt_hooks.register_hooks(self.model, self.model.__class__.__name__)
                 self.layerwise_nvtx_hooks_registered = True
 
-    @torch.inference_mode()
+    @managed_inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        # Activate IO dispatch modes on the first call (deferred from
+        # load_model to avoid interfering with memory profiling).
+        _maybe_activate_io_hooks()
+
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -3216,13 +3243,9 @@ class ModelRunnerFL(
         )
         self.kv_connector_output = kv_connector_output
 
-        # Advance IO step after the forward pass completes so that
-        # step 0 = first forward, step 1 = second forward, etc.
-        _maybe_advance_io_step()
-
         return None
 
-    @torch.inference_mode
+    @managed_inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
@@ -3371,6 +3394,10 @@ class ModelRunnerFL(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
             )
+
+        # Advance IO step after the full inference cycle (forward + sampling)
+        # so that one step encompasses both execute_model and sample_tokens.
+        _maybe_advance_io_step()
 
         ### TODO(lms): abstract async schedule for all hardware
         if not self.use_async_scheduling:
@@ -3632,6 +3659,26 @@ class ModelRunnerFL(
         if self.parallel_config.enable_eplb:
             self.eplb_state = EplbState(self.parallel_config, self.device)
             eplb_models = 0
+
+        # Initialize and activate IO dispatch modes BEFORE model loading so
+        # that init-time ops (cos, sin, arange, pow, reciprocal, cat, zeros,
+        # ones, etc. from rotary_embedding.__init__ and buffer creation) are
+        # captured.  register_module_paths / set_eager_mode are called after
+        # loading since they need the model object, but the dispatch mode
+        # itself works without them.
+        _io_env_prefixes = ("VLLM_FL_IO_INSPECT", "VLLM_FL_IO_DUMP",
+                            "VLLM_FL_IO_STEP_RANGE", "VLLM_FL_IO_LAYERS",
+                            "VLLM_FL_IO_RANK")
+        _io_requested = any(
+            k.startswith(_io_env_prefixes) for k in os.environ
+        ) or os.environ.get("VLLM_FL_CONFIG", "").strip()
+        if _io_requested:
+            from vllm_fl.dispatch.io_inspector import _init_from_env as _init_inspect
+            from vllm_fl.dispatch.io_dumper import _init_from_env as _init_dump
+            _init_inspect()
+            _init_dump()
+            _maybe_activate_io_hooks()
+
         try:
             with DeviceMemoryProfiler() as m:
                 time_before_load = time.perf_counter()
@@ -3730,7 +3777,7 @@ class ModelRunnerFL(
         from vllm_fl.dispatch.io_common import register_module_paths, set_eager_mode
         register_module_paths(self.model)
         # Tell the IO system whether torch.compile will be used so it can
-        # skip global module hooks that interfere with AOT autograd.
+        # skip TorchFunctionMode (incompatible with torch.compile).
         set_eager_mode(getattr(self.model_config, "enforce_eager", False))
         # Initialize IO inspector/dumper from env vars or YAML config.
         # This must happen AFTER set_eager_mode() so _activate_hooks() knows
