@@ -1,11 +1,11 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
 
 """
-Shared utilities for IO inspector and IO dumper.
+Shared utilities for IO dumper.
 
 Provides common formatting, filtering, feature detection,
 re-entrancy guard, execution order tracking, and YAML config
-parsing used by both io_inspector.py and io_dumper.py.
+parsing used by io_dumper.py.
 """
 
 from __future__ import annotations
@@ -41,24 +41,107 @@ except ImportError:
     HAS_TORCH_DISPATCH_MODE = False
 
 
-_io_active: bool = False
+_io_active_count: int = 0
+_io_active_lock = threading.Lock()
 
 
 def set_io_active(active: bool) -> None:
-    """Mark whether IO inspect/dump is enabled.
+    """Ref-counted IO-active flag used by the IO dumper.
 
-    Called by io_inspector/io_dumper ``enable_*`` and ``_init_from_env()``
-    so that ``managed_inference_mode`` skips ``torch.inference_mode``
-    during IO capture.  Also called on ``disable_*`` to restore normal
-    behaviour.
+    Each ``True`` increments the active count; each ``False`` decrements
+    it (down to a minimum of zero).  ``is_io_active()`` returns True as
+    long as at least one subsystem is still active, so disabling one
+    subsystem does not break ``managed_inference_mode`` for the other.
+
+    Thread-safe: guarded by ``_io_active_lock`` since enable/disable
+    may be called from different threads.
     """
-    global _io_active
-    _io_active = active
+    global _io_active_count
+    with _io_active_lock:
+        if active:
+            _io_active_count += 1
+        else:
+            _io_active_count = max(0, _io_active_count - 1)
 
 
 def is_io_active() -> bool:
-    """Return True if IO inspect or dump is currently enabled."""
-    return _io_active
+    """Return True if at least one IO subsystem (print or dump) is active."""
+    return _io_active_count > 0
+
+
+# ── Shared dispatch / function mode lifecycle ──
+
+
+class ModeManager:
+    """LIFO-safe manager for PyTorch TorchDispatchMode / TorchFunctionMode.
+
+    The dumper pushes mode instances
+    onto PyTorch's global mode stack.  PyTorch requires these to be exited
+    in strict LIFO (reverse-entry) order — exiting a mode that is not on
+    top of the stack corrupts internal state and segfaults.
+
+    ``ModeManager`` centralises entry/exit of all IO modes so that:
+    * Each subsystem calls ``enter(name, instance)`` / ``request_exit(name)``.
+    * ``request_exit`` marks the mode as *pending*.  If it is on top of the
+      stack it is exited immediately; otherwise it stays entered (the
+      ``__torch_dispatch__`` / ``__torch_function__`` handler short-circuits
+      via ``_enabled=False``).
+    * After every exit the manager *drains* — repeatedly exiting the new
+      top of the stack while it also has a pending exit.  This ensures that
+      disabling the *last* subsystem always cleans up the entire stack
+      regardless of disable order.
+
+    One ``ModeManager`` instance is created for TorchDispatchMode and
+    another for TorchFunctionMode.
+    """
+
+    def __init__(self) -> None:
+        self._stack: list[tuple[str, Any]] = []   # (name, instance), bottom-first
+        self._pending: set[str] = set()
+        self._lock = threading.Lock()
+
+    # ── public API ──
+
+    def enter(self, name: str, mode_instance: Any) -> None:
+        """Enter *mode_instance* under *name* (idempotent)."""
+        with self._lock:
+            if any(n == name for n, _ in self._stack):
+                return  # already entered
+            mode_instance.__enter__()
+            self._stack.append((name, mode_instance))
+
+    def request_exit(self, name: str) -> None:
+        """Mark *name* for exit and drain from the top while possible."""
+        with self._lock:
+            if not any(n == name for n, _ in self._stack):
+                return
+            self._pending.add(name)
+            self._drain_top()
+
+    def exit_all(self) -> None:
+        """Unconditionally exit every mode in reverse LIFO order."""
+        with self._lock:
+            while self._stack:
+                _name, inst = self._stack.pop()
+                inst.__exit__(None, None, None)
+            self._pending.clear()
+
+    def is_entered(self, name: str) -> bool:
+        """True if *name* has an active (entered) mode on the stack."""
+        return any(n == name for n, _ in self._stack)
+
+    # ── internals ──
+
+    def _drain_top(self) -> None:
+        """Pop and exit modes from the top while they have a pending exit."""
+        while self._stack and self._stack[-1][0] in self._pending:
+            name, inst = self._stack.pop()
+            self._pending.discard(name)
+            inst.__exit__(None, None, None)
+
+
+dispatch_mode_mgr = ModeManager()
+func_mode_mgr = ModeManager()
 
 
 def managed_inference_mode():
@@ -79,7 +162,7 @@ def managed_inference_mode():
     def decorator(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
-            if _io_active:
+            if is_io_active():
                 with torch.no_grad():
                     return fn(*args, **kwargs)
             with torch.inference_mode():
@@ -122,7 +205,7 @@ def _is_eager_mode() -> bool:
 def warn_if_not_eager(subsystem: str) -> None:
     """Log a hint if the model doesn't appear to be running in eager mode.
 
-    Called once when the inspector or dumper is enabled so users know
+    Called once when the dumper is enabled so users know
     they can get more comprehensive interception with ``enforce_eager=True``.
     """
     if not _is_eager_mode():
@@ -205,7 +288,7 @@ def parse_rank_filter(value: str) -> Optional[Set[int]]:
 
 # ── Re-entrancy guard (per-caller, per-thread) ──
 #
-# Each subsystem (inspector, dumper) creates its own guard via
+# Each subsystem creates its own guard via
 # ``make_guard()`` so they do not block each other.  The guard is
 # thread-local to prevent cross-thread interference.
 
@@ -214,7 +297,7 @@ def make_guard():
     """Create an independent re-entrancy guard (thread-local).
 
     Returns ``(guard_active, set_guard)`` functions.  Each caller gets
-    its own guard so the inspector and dumper do not interfere.
+    its own guard so different subsystems do not interfere.
     """
     _tls = threading.local()
 
@@ -324,7 +407,7 @@ def _reset_per_step_counters() -> Tuple[Set[str], Set[str]]:
     return seen_modules, seen_ops
 
 
-# ── Step tracking (shared by inspector and dumper) ──
+# ── Step tracking ──
 
 _step_counter: int = 0  # first forward pass runs at step 0
 _step_lock = threading.Lock()
@@ -972,7 +1055,7 @@ def module_context_matches_from_stack(
     return False
 
 
-# ── Tensor statistics (shared by inspector and dumper) ──
+# ── Tensor statistics ──
 #
 # Extensible registry: users can add custom stats via register_tensor_stat().
 
@@ -1010,7 +1093,7 @@ def register_tensor_stat(
     fn: Callable[[torch.Tensor], Any],
     float_only: bool = True,
 ) -> None:
-    """Register a custom tensor statistic for both inspector and dumper.
+    """Register a custom tensor statistic for the IO dumper.
 
     The function receives a tensor and should return a JSON-serializable
     value — scalar, list, or dict.  Scalars are displayed inline;
@@ -1050,7 +1133,7 @@ def register_tensor_stat(
 def tensor_stats(t: torch.Tensor) -> Dict[str, Any]:
     """Compute shape, dtype, device, and all registered statistics for a tensor.
 
-    Used by both the inspector (text formatting) and the dumper (JSON metadata).
+    Used by the dumper for text formatting and JSON metadata.
     Returns a dict like ``{"shape": [...], "dtype": "...", "min": ..., ...}``.
     """
     meta: Dict[str, Any] = {
@@ -1250,12 +1333,11 @@ def record_seen(
 
 # ── Torch func tag management ──
 #
-# When both inspector and dumper TorchFunctionMode handlers are active,
-# they are stacked: the outer handler calls func() which enters the inner.
-# Without coordination, both would call make_op_tag() / next_exec_order(),
-# double-incrementing the shared counters.  These helpers ensure that tags
-# and exec_order are generated once (by the first handler) and reused by
-# the nested handler.
+# When multiple TorchFunctionMode handlers are stacked, the outer handler
+# calls func() which enters the inner.  Without coordination, both would
+# call make_op_tag() / next_exec_order(), double-incrementing the shared
+# counters.  These helpers ensure that tags and exec_order are generated
+# once (by the first handler) and reused by the nested handler.
 
 _tf_tags = threading.local()
 
@@ -1305,22 +1387,13 @@ def release_torch_func_tags() -> None:
 
 def parse_io_config_from_yaml(config_path: str) -> Dict[str, Any]:
     """
-    Parse IO inspect/dump settings from a YAML config file.
+    Parse IO dump settings from a YAML config file.
 
     Expected YAML structure (all fields optional)::
 
-        io_inspect:
-          enabled: true           # boolean: true/false
-          ops:
-            - rms_norm
-            - silu_and_mul
-          modules:
-            - Linear
-            - RMSNormFL
-          torch_funcs: true       # or list ["matmul", "softmax"]
-
         io_dump:
           dir: /tmp/io_dump
+          print: true             # enable console logging
           ops:
             - rms_norm
           modules:
@@ -1330,9 +1403,8 @@ def parse_io_config_from_yaml(config_path: str) -> Dict[str, Any]:
           torch_funcs: true
 
     Returns:
-        Dict with keys "io_inspect" and/or "io_dump", each a dict
-        of parsed settings.  Returns empty dict if file not found
-        or has no io_inspect/io_dump sections.
+        Dict with key "io_dump" containing parsed settings.
+        Returns empty dict if file not found or has no io_dump section.
     """
     if not os.path.isfile(config_path):
         return {}
@@ -1345,10 +1417,6 @@ def parse_io_config_from_yaml(config_path: str) -> Dict[str, Any]:
         return {}
 
     result: Dict[str, Any] = {}
-
-    inspect_cfg = config.get("io_inspect")
-    if isinstance(inspect_cfg, dict):
-        result["io_inspect"] = _parse_inspect_section(inspect_cfg)
 
     dump_cfg = config.get("io_dump")
     if isinstance(dump_cfg, dict):
@@ -1379,36 +1447,6 @@ def _parse_step_range_yaml(cfg: Dict[str, Any]) -> Optional[Tuple[int, int]]:
     return parse_step_range(step_range)
 
 
-def _parse_inspect_section(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Parse the io_inspect section of a YAML config."""
-    parsed: Dict[str, Any] = {}
-
-    enabled = cfg.get("enabled", False)
-    if isinstance(enabled, bool):
-        parsed["enabled"] = enabled
-    elif isinstance(enabled, str):
-        parsed["enabled"] = enabled.strip() not in ("", "0", "false", "False")
-    elif isinstance(enabled, int):
-        parsed["enabled"] = bool(enabled)
-    else:
-        parsed["enabled"] = False
-
-    parsed["ops"] = _parse_string_list(cfg.get("ops"))
-    parsed["modules"] = _parse_string_list(cfg.get("modules"))
-    parsed["layers"] = expand_layer_specs(_parse_string_list(cfg.get("layers")))
-    parsed["step_range"] = _parse_step_range_yaml(cfg)
-
-    # Only include torch_funcs when explicitly set in YAML so that
-    # _init_from_env can apply the match-all default for absent keys.
-    if "torch_funcs" in cfg:
-        parsed["torch_funcs"] = _parse_torch_funcs_yaml(cfg["torch_funcs"])
-    parsed["ranks"] = _parse_ranks_yaml(cfg.get("ranks"))
-    if "summary_only" in cfg:
-        parsed["summary_only"] = bool(cfg["summary_only"])
-
-    return parsed
-
-
 def _parse_dump_section(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Parse the io_dump section of a YAML config."""
     parsed: Dict[str, Any] = {}
@@ -1436,6 +1474,8 @@ def _parse_dump_section(cfg: Dict[str, Any]) -> Dict[str, Any]:
     parsed["meta_only"] = bool(cfg.get("meta_only", True))
     if "summary_only" in cfg:
         parsed["summary_only"] = bool(cfg["summary_only"])
+    if "print" in cfg:
+        parsed["print"] = bool(cfg["print"])
 
     return parsed
 

@@ -219,11 +219,10 @@ from vllm_fl.dispatch.io_common import managed_inference_mode
 
 logger = init_logger(__name__)
 
-# ── IO inspect/dump step tracking ──
+# ── IO dump step tracking ──
 # Cached references resolved on first call; thereafter a single bool check
 # per execute_model call when IO features are disabled.
 _io_advance_step = None
-_io_inspect_enabled = None
 _io_dump_enabled = None
 _io_hooks_activated = False
 
@@ -235,35 +234,34 @@ def _maybe_activate_io_hooks() -> None:
     ``load_model()``, but defers dispatch mode activation so that the
     modes don't interfere with vLLM's ``determine_available_memory()``.
     This function enters the modes just before the first ``execute_model()``.
+
+    The flag is set only after successful activation so that a transient
+    failure does not permanently prevent retries on subsequent calls.
     """
     global _io_hooks_activated
     if _io_hooks_activated:
         return
-    _io_hooks_activated = True
     try:
-        from vllm_fl.dispatch.io_inspector import maybe_activate_hooks as _act_inspect
         from vllm_fl.dispatch.io_dumper import maybe_activate_hooks as _act_dump
-        _act_inspect()
         _act_dump()
+        _io_hooks_activated = True
     except Exception as exc:
-        logger.warning("Failed to activate IO hooks: %s", exc)
+        logger.warning("Failed to activate IO hooks: %s", exc, exc_info=True)
 
 
 def _maybe_advance_io_step() -> None:
-    """Advance the IO step counter if IO inspect or dump is active.
+    """Advance the IO step counter if IO dump is active.
 
     Lazy-imports on first call to avoid import-time overhead.
     Subsequent calls cost one bool-check each when features are off.
     """
-    global _io_advance_step, _io_inspect_enabled, _io_dump_enabled
+    global _io_advance_step, _io_dump_enabled
     if _io_advance_step is None:
         from vllm_fl.dispatch.io_common import advance_step
-        from vllm_fl.dispatch.io_inspector import is_inspect_enabled
         from vllm_fl.dispatch.io_dumper import is_dump_enabled
         _io_advance_step = advance_step
-        _io_inspect_enabled = is_inspect_enabled
         _io_dump_enabled = is_dump_enabled
-    if _io_inspect_enabled() or _io_dump_enabled():
+    if _io_dump_enabled():
         _io_advance_step()
 
 
@@ -2987,9 +2985,6 @@ class ModelRunnerFL(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        # Activate IO dispatch modes on the first call (deferred from
-        # load_model to avoid interfering with memory profiling).
-        _maybe_activate_io_hooks()
 
         if self.execute_model_state is not None:
             raise RuntimeError(
@@ -3660,24 +3655,20 @@ class ModelRunnerFL(
             self.eplb_state = EplbState(self.parallel_config, self.device)
             eplb_models = 0
 
-        # Initialize and activate IO dispatch modes BEFORE model loading so
-        # that init-time ops (cos, sin, arange, pow, reciprocal, cat, zeros,
-        # ones, etc. from rotary_embedding.__init__ and buffer creation) are
-        # captured.  register_module_paths / set_eager_mode are called after
-        # loading since they need the model object, but the dispatch mode
-        # itself works without them.
-        _io_env_prefixes = ("VLLM_FL_IO_INSPECT", "VLLM_FL_IO_DUMP",
-                            "VLLM_FL_IO_STEP_RANGE", "VLLM_FL_IO_LAYERS",
-                            "VLLM_FL_IO_RANK")
+        # IO dumper: parse config and (in eager mode) activate dispatch hooks
+        # before model loading so init-time ops are captured.  In graph mode,
+        # hooks are deferred to the first execute_model() call because
+        # TorchDispatchMode alters torch.compile graph structure.
         _io_requested = any(
-            k.startswith(_io_env_prefixes) for k in os.environ
+            k.startswith("VLLM_FL_IO_DUMP") for k in os.environ
         ) or os.environ.get("VLLM_FL_CONFIG", "").strip()
         if _io_requested:
-            from vllm_fl.dispatch.io_inspector import _init_from_env as _init_inspect
+            from vllm_fl.dispatch.io_common import set_eager_mode
             from vllm_fl.dispatch.io_dumper import _init_from_env as _init_dump
-            _init_inspect()
+            set_eager_mode(getattr(self.model_config, "enforce_eager", False))
             _init_dump()
-            _maybe_activate_io_hooks()
+            if getattr(self.model_config, "enforce_eager", False):
+                _maybe_activate_io_hooks()
 
         try:
             with DeviceMemoryProfiler() as m:
@@ -3771,28 +3762,10 @@ class ModelRunnerFL(
             scope="local",
         )
 
-        # Always register module paths — cheap (one pass over named_modules)
-        # and required by all three IO configuration methods (env vars, YAML,
-        # and the Python API) for layer-path filtering to work.
-        from vllm_fl.dispatch.io_common import register_module_paths, set_eager_mode
-        register_module_paths(self.model)
-        # Tell the IO system whether torch.compile will be used so it can
-        # skip TorchFunctionMode (incompatible with torch.compile).
-        set_eager_mode(getattr(self.model_config, "enforce_eager", False))
-        # Initialize IO inspector/dumper from env vars or YAML config.
-        # This must happen AFTER set_eager_mode() so _activate_hooks() knows
-        # whether to register global module hooks (incompatible with torch.compile).
-        _io_env_prefixes = ("VLLM_FL_IO_INSPECT", "VLLM_FL_IO_DUMP",
-                            "VLLM_FL_IO_STEP_RANGE", "VLLM_FL_IO_LAYERS",
-                            "VLLM_FL_IO_RANK")
-        _io_requested = any(
-            k.startswith(_io_env_prefixes) for k in os.environ
-        ) or os.environ.get("VLLM_FL_CONFIG", "").strip()
+        # IO dumper: register module paths for layer-path filtering.
         if _io_requested:
-            from vllm_fl.dispatch.io_inspector import _init_from_env as _init_inspect
-            from vllm_fl.dispatch.io_dumper import _init_from_env as _init_dump
-            _init_inspect()
-            _init_dump()
+            from vllm_fl.dispatch.io_common import register_module_paths
+            register_module_paths(self.model)
 
         prepare_communication_buffer_for_model(self.model)
         if (drafter := getattr(self, "drafter", None)) and (

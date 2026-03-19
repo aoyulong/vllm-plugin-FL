@@ -15,12 +15,6 @@ from typing import Callable, Dict, Optional, Set, Tuple
 from .registry import OpRegistry
 from .policy import SelectionPolicy, get_policy
 from .types import OpImpl, BackendImplKind, match_token
-from .io_inspector import (
-    inspect_before,
-    inspect_after,
-    inspect_cleanup,
-    is_inspect_enabled,
-)
 from .io_dumper import (
     dump_before,
     dump_after,
@@ -402,69 +396,44 @@ class OpManager:
         return unique_candidates
 
     def _call_with_hooks(self, op_name: str, fn, args: tuple, kwargs: dict):
-        """Call fn, wrapping with IO inspect/dump hooks only when enabled.
+        """Call fn, wrapping with IO dump hooks only when enabled.
 
-        A single execution-order number is allocated and shared between
-        the inspector and dumper so that log lines and dump files can be
-        correlated.  If ``fn`` raises, any dump pairing pushed by
-        ``dump_before`` is cleaned up to keep the thread-local stack
-        consistent.
+        A single execution-order number is allocated so that log lines
+        and dump files can be correlated.  If ``fn`` raises, any dump
+        pairing pushed by ``dump_before`` is cleaned up to keep the
+        thread-local stack consistent.
 
         Hook failures are logged and swallowed so that diagnostic hooks
         never break the dispatched operator call.
         """
-        do_inspect = is_inspect_enabled()
         do_dump = is_dump_enabled()
 
-        if not do_inspect and not do_dump:
+        if not do_dump:
             return fn(*args, **kwargs)
 
-        # Allocate a single exec_order, module_tag, and op_tag shared by
-        # inspector and dumper so that log lines and dump files correlate
-        # and shared counters are not double-incremented.
         order = next_exec_order()
         module_tag = make_module_tag()
         op_tag = make_op_tag(op_name)
 
-        if do_inspect:
-            try:
-                inspect_before(op_name, args, kwargs, exec_order=order,
-                               module_tag=module_tag, op_tag=op_tag)
-            except Exception as e:
-                logger.debug(f"inspect_before hook failed for '{op_name}': {e}")
-        if do_dump:
-            try:
-                dump_before(op_name, args, kwargs, exec_order=order,
-                            module_tag=module_tag, op_tag=op_tag)
-            except Exception as e:
-                logger.debug(f"dump_before hook failed for '{op_name}': {e}")
+        try:
+            dump_before(op_name, args, kwargs, exec_order=order,
+                        module_tag=module_tag, op_tag=op_tag)
+        except Exception as e:
+            logger.debug(f"dump_before hook failed for '{op_name}': {e}")
 
         try:
             result = fn(*args, **kwargs)
         except Exception:
-            # Clean up stale pairings so the stacks stay consistent
-            if do_inspect:
-                try:
-                    inspect_cleanup(op_name)
-                except Exception:
-                    pass
-            if do_dump:
-                try:
-                    dump_cleanup(op_name)
-                except Exception:
-                    pass
+            try:
+                dump_cleanup(op_name)
+            except Exception:
+                pass
             raise
 
-        if do_inspect:
-            try:
-                inspect_after(op_name, args, result)
-            except Exception as e:
-                logger.debug(f"inspect_after hook failed for '{op_name}': {e}")
-        if do_dump:
-            try:
-                dump_after(op_name, args, result)
-            except Exception as e:
-                logger.debug(f"dump_after hook failed for '{op_name}': {e}")
+        try:
+            dump_after(op_name, args, result)
+        except Exception as e:
+            logger.debug(f"dump_after hook failed for '{op_name}': {e}")
 
         return result
 

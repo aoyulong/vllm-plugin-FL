@@ -377,7 +377,7 @@ class TestProgrammaticAPI:
         assert io_dumper._dump_dir == ""
         assert io_dumper._op_filter == set()
         assert io_dumper._max_calls == 0
-        # Step counter is shared with inspector; disabling the dumper
+        # Step counter is shared; disabling the dumper
         # should NOT reset it (only explicit reset_step() should).
         assert get_step() >= 1
 
@@ -531,9 +531,9 @@ class TestTorchDispatchMode:
     )
     def test_dispatch_mode_auto_activated(self, dump_dir):
         enable_io_dump(dump_dir)
-        from vllm_fl.dispatch.io_dumper import _dispatch_mode_instance
+        from vllm_fl.dispatch.io_common import dispatch_mode_mgr
 
-        assert _dispatch_mode_instance is not None
+        assert dispatch_mode_mgr.is_entered("dump")
 
     @pytest.mark.skipif(
         not HAS_TORCH_DISPATCH_MODE,
@@ -565,13 +565,12 @@ class TestTorchDispatchMode:
     )
     def test_dispatch_mode_deactivated_on_disable(self, dump_dir):
         enable_io_dump(dump_dir, modules={"Linear"})
-        from vllm_fl.dispatch.io_dumper import _dispatch_mode_instance
+        from vllm_fl.dispatch.io_common import dispatch_mode_mgr
 
-        assert _dispatch_mode_instance is not None
+        assert dispatch_mode_mgr.is_entered("dump")
         disable_io_dump()
-        from vllm_fl.dispatch import io_dumper
 
-        assert io_dumper._dispatch_mode_instance is None
+        assert not dispatch_mode_mgr.is_entered("dump")
 
     @pytest.mark.skipif(
         not HAS_TORCH_DISPATCH_MODE,
@@ -580,9 +579,9 @@ class TestTorchDispatchMode:
     def test_dispatch_mode_activated_in_match_all(self, dump_dir):
         """In match-all mode, TorchDispatchMode is activated."""
         enable_io_dump(dump_dir)
-        from vllm_fl.dispatch.io_dumper import _dispatch_mode_instance
+        from vllm_fl.dispatch.io_common import dispatch_mode_mgr
 
-        assert _dispatch_mode_instance is not None
+        assert dispatch_mode_mgr.is_entered("dump")
 
 
 class TestDumpTorchFunctionMode:
@@ -601,9 +600,9 @@ class TestDumpTorchFunctionMode:
     )
     def test_torch_func_mode_activated(self, dump_dir):
         enable_io_dump(dump_dir, torch_funcs=True)
-        from vllm_fl.dispatch.io_dumper import _torch_func_mode_instance
+        from vllm_fl.dispatch.io_common import func_mode_mgr
 
-        assert _torch_func_mode_instance is not None
+        assert func_mode_mgr.is_entered("dump")
 
     @pytest.mark.skipif(
         not HAS_TORCH_FUNC_MODE,
@@ -612,9 +611,9 @@ class TestDumpTorchFunctionMode:
     def test_torch_func_mode_deactivated_on_disable(self, dump_dir):
         enable_io_dump(dump_dir, torch_funcs=True)
         disable_io_dump()
-        from vllm_fl.dispatch.io_dumper import _torch_func_mode_instance
+        from vllm_fl.dispatch.io_common import func_mode_mgr
 
-        assert _torch_func_mode_instance is None
+        assert not func_mode_mgr.is_entered("dump")
 
     @pytest.mark.skipif(
         not HAS_TORCH_FUNC_MODE,
@@ -649,9 +648,9 @@ class TestDumpTorchFunctionMode:
     )
     def test_torch_func_mode_not_activated_by_default(self, dump_dir):
         enable_io_dump(dump_dir)  # torch_funcs=False by default
-        from vllm_fl.dispatch.io_dumper import _torch_func_mode_instance
+        from vllm_fl.dispatch.io_common import func_mode_mgr
 
-        assert _torch_func_mode_instance is None
+        assert not func_mode_mgr.is_entered("dump")
 
     @pytest.mark.skipif(
         not HAS_TORCH_FUNC_MODE,
@@ -659,9 +658,9 @@ class TestDumpTorchFunctionMode:
     )
     def test_torch_func_mode_not_activated_when_disabled(self, dump_dir):
         enable_io_dump(dump_dir, torch_funcs=False)
-        from vllm_fl.dispatch.io_dumper import _torch_func_mode_instance
+        from vllm_fl.dispatch.io_common import func_mode_mgr
 
-        assert _torch_func_mode_instance is None
+        assert not func_mode_mgr.is_entered("dump")
 
     @pytest.mark.skipif(
         not HAS_TORCH_FUNC_MODE,
@@ -1064,7 +1063,7 @@ class TestRankFilterInDumper:
 
     @patch.dict(
         os.environ,
-        {"VLLM_FL_IO_DUMP": "/tmp/test_dump", "VLLM_FL_IO_RANK": "0"},
+        {"VLLM_FL_IO_DUMP": "/tmp/test_dump", "VLLM_FL_IO_DUMP_RANK": "0"},
         clear=False,
     )
     def test_env_rank_filter(self):
@@ -1075,7 +1074,7 @@ class TestRankFilterInDumper:
 
     @patch.dict(
         os.environ,
-        {"VLLM_FL_IO_DUMP": "/tmp/test_dump", "VLLM_FL_IO_RANK": "3"},
+        {"VLLM_FL_IO_DUMP": "/tmp/test_dump", "VLLM_FL_IO_DUMP_RANK": "3"},
         clear=False,
     )
     def test_env_rank_filter_blocks(self):
@@ -1315,12 +1314,11 @@ class TestLayerFilter:
         os.environ,
         {
             "VLLM_FL_IO_DUMP": "/tmp/test_dump",
-            "VLLM_FL_IO_LAYERS": "model.layers.0,model.layers.1",
+            "VLLM_FL_IO_DUMP_LAYERS": "model.layers.0,model.layers.1",
         },
         clear=False,
     )
-    def test_env_shared_layer_filter(self):
-        os.environ.pop("VLLM_FL_IO_DUMP_LAYERS", None)
+    def test_env_dump_layer_filter(self):
         io_dumper._init_from_env()
         assert io_dumper._layer_filter == {"model.layers.0", "model.layers.1"}
 
@@ -1331,7 +1329,9 @@ class TestLayerFilter:
     def test_layer_filter_activates_dispatch_mode(self, dump_dir):
         """Layer filter needs TorchDispatchMode for stack-based path tracking."""
         enable_io_dump(dump_dir, ops={"rms_norm"}, layers={"model.layers.0"})
-        assert io_dumper._dispatch_mode_instance is not None
+        from vllm_fl.dispatch.io_common import dispatch_mode_mgr
+
+        assert dispatch_mode_mgr.is_entered("dump")
 
 
 class TestComposableFilters:
@@ -1713,13 +1713,13 @@ class TestSummaryOnly:
             assert io_dumper._summary_only is True
         disable_io_dump()
 
-    def test_summary_only_shared_env_var(self, dump_dir):
-        """VLLM_FL_IO_SUMMARY_ONLY=1 enables summary_only via shared fallback."""
+    def test_summary_only_dump_env_var(self, dump_dir):
+        """VLLM_FL_IO_DUMP_SUMMARY_ONLY=1 enables summary_only."""
         with patch.dict(
             os.environ,
             {
                 "VLLM_FL_IO_DUMP": dump_dir,
-                "VLLM_FL_IO_SUMMARY_ONLY": "1",
+                "VLLM_FL_IO_DUMP_SUMMARY_ONLY": "1",
             },
         ):
             from vllm_fl.dispatch.io_dumper import _init_from_env
