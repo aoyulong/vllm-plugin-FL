@@ -4,64 +4,61 @@
 IO Dumper for vllm-plugin-FL dispatch.
 
 Handles both file dumping and console printing (logging) of operator I/O.
-The ``print_io`` toggle enables console logging of inputs/outputs alongside
+The ``with_print`` toggle enables console logging of inputs/outputs alongside
 (or instead of) file dumping.
 
 Saves operator input/output tensors to disk as PyTorch .pt files.
 
 Only dumps at the **op level** (dispatch-managed ops and bare torch functions).
 Module-level dumping is not produced; module names are included in dump
-metadata only when ``modules`` or ``layers`` filters are active (requires
-a Python call-stack walk per op).  Without filters, ``module_tag`` in
-dump JSON will be empty for performance reasons.
+metadata via the thread-local context set by module hooks.  The ``module_tag``
+field is always populated when ops run inside a tracked module.
 
 When a ``modules`` filter is set (e.g., ``modules={"RMSNormFL"}``), module
-context is derived from the Python call stack.  Only ops that run inside
-the specified modules are dumped.
+context is read from the thread-local set by module hooks.  Only ops that run
+inside the specified modules are dumped.
 
 Supports three interception mechanisms:
 1. Dispatch-managed ops: Automatic via OpManager.call() hooks
 2. ATen-level ops: Via TorchDispatchMode (default, works in both eager and compile modes)
 3. Bare torch functions: Via TorchFunctionMode (opt-in, eager mode only)
 
-When initialized via environment variables (``_init_from_env``), config is parsed
-during ``load_model()`` but dispatch mode activation is deferred until
-``maybe_activate_hooks()`` is called from ``execute_model()``.  This prevents
-the dispatch mode from interfering with vLLM's ``determine_available_memory()``
-phase.  The programmatic API (``enable_io_dump()``) activates hooks immediately.
+Initialized via ``init_io_dump_from_env()`` (called from ``model_runner.load_model()``)
+or the programmatic API ``enable_io_dump()``.  Both parse config and activate hooks
+immediately; the env-var path is a no-op in graph mode (``enforce_eager=False``).
 
 Configuration (priority order):
-    1. Python API: enable_io_dump(dump_dir=..., ops=..., step_range=..., layers=..., print_io=True)
+    1. Python API: enable_io_dump(dump_dir=..., ops=..., step_range=..., layers=..., with_print=True)
     2. YAML config file (via VLLM_FL_CONFIG):
         io_dump:
           dir: /tmp/io_dump
-          print: true
+          with_print: true          # enable console logging of I/O
           ops: [rms_norm, silu_and_mul]
           modules: [Linear]
           layers: [0, 1-3, model.layers.*.self_attn]
           max_calls: 100
-          step_range: "5-15"      # inclusive "start-end"
-          torch_funcs: true
-          meta_only: true          # default; set false to dump .pt tensors
-          summary_only: false     # default true; set false for per-op dumps
+          step_range: "5-15"        # inclusive "start-end"
+          with_torch_funcs: true    # intercept bare torch functions
+          with_metas: true          # write per-op input/output JSON (default: summary only)
+          with_values: true         # write per-call .pt tensor files (default: off)
     3. Environment variables:
-        VLLM_FL_IO_DUMP              - Directory path or "1" for ./io_dump
-        VLLM_FL_IO_DUMP_PRINT      - "1" to enable console logging of I/O
-        VLLM_FL_IO_DUMP_OPS          - Comma-separated op names
-        VLLM_FL_IO_DUMP_MODULES      - Comma-separated module class names
-        VLLM_FL_IO_DUMP_LAYERS       - Layer specs: integers, ranges, globs, paths
-        VLLM_FL_IO_DUMP_MAX_CALLS    - Max calls per op (0 = unlimited)
-        VLLM_FL_IO_DUMP_STEP_RANGE   - "start-end" inclusive range (e.g. "0-4")
-        VLLM_FL_IO_DUMP_TORCH_FUNCS  - "1" or "matmul,softmax"
-        VLLM_FL_IO_DUMP_META_ONLY    - "0"/"false" to dump .pt tensors (default: meta only)
-        VLLM_FL_IO_DUMP_SUMMARY_ONLY - "0"/"false" for per-op dumps (default: summary only)
-        VLLM_FL_IO_DUMP_RANK         - Rank filter: "all", "0", "0,2,4"
+        VLLM_FL_IO_DUMP                  - Directory path or "1" for ./io_dump
+        VLLM_FL_IO_DUMP_OPS              - Comma-separated op names
+        VLLM_FL_IO_DUMP_MODULES          - Comma-separated module class names
+        VLLM_FL_IO_DUMP_LAYERS           - Layer specs: integers, ranges, globs, paths
+        VLLM_FL_IO_DUMP_MAX_CALLS        - Max calls per op (0 = unlimited)
+        VLLM_FL_IO_DUMP_STEP_RANGE       - "start-end" inclusive range (e.g. "0-4")
+        VLLM_FL_IO_DUMP_RANK             - Rank filter: "all", "0", "0,2,4"
+        VLLM_FL_IO_DUMP_WITH_PRINT       - "1" to enable console logging of I/O
+        VLLM_FL_IO_DUMP_WITH_TORCH_FUNCS - "1" or "matmul,softmax" to intercept torch funcs
+        VLLM_FL_IO_DUMP_WITH_METAS       - "1" to write per-op input/output JSON files
+        VLLM_FL_IO_DUMP_WITH_VALUES      - "1" to write per-call .pt tensor data files
 
     Note: Setting any filter env var (step_range or layers) auto-enables
     dumping for all ops, even without VLLM_FL_IO_DUMP=1.
 
     Quick start (env-var only, no Python API needed):
-        VLLM_FL_IO_DUMP_STEP_RANGE=0-2 VLLM_FL_IO_DUMP_LAYERS=1-3 python script.py
+        VLLM_FL_IO_DUMP_STEP_RANGE=0-2 VLLM_FL_IO_DUMP_LAYERS=1-3 VLLM_FL_IO_DUMP_WITH_METAS=1 python script.py
 
 All filter dimensions are composable (AND logic): step_range, layers, modules,
 and ops are orthogonal gates.  When multiple filters are set, an op must pass
@@ -73,7 +70,7 @@ File layout:
         step_0005/rms_norm/
             input.json             # merged metadata for all calls' inputs
             output.json            # merged metadata for all calls' outputs
-            call_1_input.pt        # tensor data for call 1 inputs (meta_only=False)
+            call_1_input.pt        # tensor data for call 1 inputs (with_values=True)
             call_1_output.pt       # tensor data for call 1 outputs
             call_2_input.pt
             call_2_output.pt
@@ -83,12 +80,14 @@ File layout:
             ...
 
     JSON keys (``call_1``, ``call_2``, ...) match the PT file names for
-    easy cross-reference.  When ``meta_only=True`` (default), only JSON
-    files are written.
+    easy cross-reference.  When ``with_values=False`` (default), only JSON
+    files are written; when ``with_metas=False`` (default), only summary.json
+    is written.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import threading
@@ -117,19 +116,19 @@ from .io_common import (
     get_dispatch_op_name,
     get_dispatch_op_namespace,
     get_module_class_name,
-    get_module_context_from_stack,
     get_rank,
     get_step,
     get_torch_func_name,
     layer_path_matches,
-    layer_path_matches_from_stack,
     make_guard,
     make_label,
     make_module_tag_from_ctx,
     make_op_tag,
     module_context_matches,
-    module_context_matches_from_stack,
     next_exec_order,
+    pop_module_context,
+    push_module_context,
+    register_module_paths,
     parse_io_config_from_yaml,
     parse_layers_env,
     parse_rank_filter,
@@ -144,8 +143,6 @@ from .io_common import (
     should_inspect_torch_func,
     tensor_stats,
     unregister_step_callback,
-    warn_if_not_eager,
-    _is_eager_mode,
 )
 from .logger_manager import get_logger
 
@@ -165,8 +162,8 @@ _module_filter: Set[str] = set()
 _layer_filter: Set[str] = set()
 _max_calls: int = 0  # 0 = unlimited
 _step_range: Optional[Tuple[int, int]] = None
-_meta_only: bool = True
-_summary_only: bool = False  # When True, only collect summary (no per-op dump)
+_with_values: bool = False  # write per-call .pt tensor data files
+_with_metas: bool = False   # write per-op input/output JSON files (summary-only when False)
 
 # Print (console logging) state
 _print_enabled: bool = False
@@ -179,9 +176,34 @@ _lock = threading.Lock()
 # op_name → {dispatch_keys: [...], call_count: int}
 _op_summary: Dict[str, Dict[str, Any]] = {}
 
-# Per-file locks for _append_to_json to prevent concurrent read-modify-write corruption
-_json_file_locks: Dict[str, threading.Lock] = {}
-_json_file_locks_guard = threading.Lock()
+# ── Async I/O state ──
+# Background executor for stats computation and file writes.
+# Threading is sufficient: PyTorch releases the GIL during tensor ops and I/O.
+_bg_workers: int = 8  # configurable via enable_io_dump(bg_workers=...) / VLLM_FL_IO_DUMP_BG_WORKERS
+_io_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_pending_futures: List[concurrent.futures.Future] = []
+_pending_lock = threading.Lock()
+
+# Streaming JSON Lines file handles, one file per json_path per step.
+# _WipHandle tracks an open file handle plus an ordered-write reorder buffer
+# so that lines are always written in call_num order even if background tasks
+# complete out of order.  Step end closes all handles; no finalization needed.
+
+
+class _WipHandle:
+    """Per-file state for in-order JSON Lines streaming."""
+
+    __slots__ = ("fh", "lock", "pending", "next_write")
+
+    def __init__(self, fh: Any) -> None:
+        self.fh = fh
+        self.lock = threading.Lock()
+        self.pending: Dict[int, str] = {}  # call_num -> JSON line
+        self.next_write: int = 1  # _next_call_num always starts at 1 per op per step
+
+
+_open_file_handles: Dict[str, "_WipHandle"] = {}
+_open_files_lock = threading.Lock()
 
 # Thread-local storage for pairing dump_before → dump_after.
 # Each thread stores a dict of op_name → list of (call_num, exec_order, op_dir).
@@ -204,6 +226,7 @@ def _rank_ok() -> bool:
 
 # Hook state
 _hooks_activated: bool = False  # True once dispatch/func modes have been entered
+_module_hook_handles: List[Any] = []  # PyTorch forward hook handles for module context
 
 
 # ── Print formatting / pairing helpers ──
@@ -289,8 +312,9 @@ def _on_step_advance(step: int, seen_modules: Set[str], seen_ops: Set[str]) -> N
 
     with _lock:
         _call_counters.clear()
-    # Write/update summary.json after each step so it survives crashes
+    # Drain background tasks and flush buffered JSON before writing summary
     if _dump_dir:
+        _wait_and_flush()
         _write_summary()
     if seen_modules or seen_ops:
         rank = get_rank()
@@ -346,26 +370,18 @@ def _should_dump(op_name: str, args: tuple) -> bool:
     return bool(_op_filter) or bool(_module_filter)
 
 
-def _should_dump_torch_func(func_name: str, module_ctx=None) -> bool:
+def _should_dump_torch_func(func_name: str) -> bool:
     """Check if a torch function should be dumped.
 
     Layer and module filters are AND gates (same as ``_should_dump``).
-
-    Args:
-        func_name: Torch function name.
-        module_ctx: Stack-derived module context (from ``get_module_context_from_stack``).
-            If provided, used for layer/module filtering instead of global hook context.
+    Uses thread-local module context set by module hooks.
     """
     if _step_range is not None:
         step = get_step()
         if step < _step_range[0] or step >= _step_range[1]:
             return False
-    if _layer_filter:
-        if module_ctx is not None:
-            if not layer_path_matches_from_stack(_layer_filter, module_ctx):
-                return False
-        elif not layer_path_matches(_layer_filter):
-            return False
+    if _layer_filter and not layer_path_matches(_layer_filter):
+        return False
     if not should_inspect_torch_func(
         func_name, _torch_funcs_enabled, _torch_func_filter,
         _match_all, _op_filter,
@@ -373,8 +389,6 @@ def _should_dump_torch_func(func_name: str, module_ctx=None) -> bool:
         return False
     # When module filter is active, only match torch funcs inside those modules
     if _module_filter and not _match_all:
-        if module_ctx is not None:
-            return module_context_matches_from_stack(_module_filter, module_ctx)
         return module_context_matches(_module_filter)
     return True
 
@@ -397,37 +411,12 @@ def _serialize_value(value: Any) -> Any:
     return f"<{type(value).__name__}>"
 
 
-def _build_meta(args: tuple, kwargs: dict, *, is_output: bool = False) -> Dict[str, Any]:
-    """Build tensor metadata dict for JSON.
-
-    For inputs: keys are ``arg_0``, ``arg_1``, ..., ``kwarg_<name>``.
-    For outputs (when *is_output* is True and *args* is a tuple result):
-    keys are ``result_0``, ``result_1``, ... or just ``result``.
-    """
-    meta: Dict[str, Any] = {}
-    if is_output:
-        # args is actually (result,) and kwargs is empty
-        result = args[0] if args else None
-        if isinstance(result, tuple):
-            for i, v in enumerate(result):
-                if isinstance(v, torch.Tensor):
-                    meta[f"result_{i}"] = tensor_stats(v)
-        elif isinstance(result, torch.Tensor):
-            meta["result"] = tensor_stats(result)
-    else:
-        for i, arg in enumerate(args):
-            if isinstance(arg, torch.Tensor):
-                meta[f"arg_{i}"] = tensor_stats(arg)
-        for k, v in kwargs.items():
-            if isinstance(v, torch.Tensor):
-                meta[f"kwarg_{k}"] = tensor_stats(v)
-    return meta
-
-
 def _build_data(args: tuple, kwargs: dict, *, is_output: bool = False) -> Dict[str, Any]:
     """Build tensor data dict for torch.save (PT file).
 
-    Keys match those produced by ``_build_meta`` so users can cross-reference.
+    Keys use the same scheme as ``_dump_input`` / ``_dump_output`` metadata
+    (``arg_N``, ``kwarg_<name>``, ``result`` / ``result_N``) for easy
+    cross-reference between .pt files and JSON.
     """
     data: Dict[str, Any] = {}
     if is_output:
@@ -464,16 +453,14 @@ def _sanitize_path_component(name: str) -> str:
 def _push_pairing(op_name: str, call_num: int, exec_order: int, op_dir: str,
                    label: Optional[str] = None,
                    module_tag: str = "",
-                   op_tag: str = "",
-                   dispatch_keys: Optional[List[Tuple[str, str, bool]]] = None) -> None:
+                   op_tag: str = "") -> None:
     """Store pairing info in thread-local for dump_after to consume."""
     stack = getattr(_dump_pairing, "stack", None)
     if stack is None:
         _dump_pairing.stack = {}
         stack = _dump_pairing.stack
     stack.setdefault(op_name, []).append(
-        (call_num, exec_order, op_dir, label or op_name, module_tag, op_tag,
-         dispatch_keys)
+        (call_num, exec_order, op_dir, label or op_name, module_tag, op_tag)
     )
 
 
@@ -505,41 +492,146 @@ def _next_call_num(op_name: str) -> int:
         return count
 
 
-def _get_json_lock(json_path: str) -> threading.Lock:
-    """Get or create a per-file lock for JSON read-modify-write."""
-    with _json_file_locks_guard:
-        lock = _json_file_locks.get(json_path)
-        if lock is None:
-            lock = threading.Lock()
-            _json_file_locks[json_path] = lock
-        return lock
+def _get_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _io_executor
+    if _io_executor is None or _io_executor._shutdown:
+        _io_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=_bg_workers, thread_name_prefix="io_dump_bg")
+    return _io_executor
 
 
-def _append_to_json(json_path: str, key: str, value: dict) -> None:
-    """Add a key to a JSON file (read-modify-write). Creates file if needed.
+def _submit_bg(fn, *args, **kwargs) -> None:
+    """Submit work to background executor; track future for later drain."""
+    fut = _get_executor().submit(fn, *args, **kwargs)
+    with _pending_lock:
+        _pending_futures.append(fut)
 
-    Uses a per-file lock to prevent concurrent updates from corrupting the file.
-    If the existing file is corrupted or unreadable, it is treated as empty so
-    that subsequent dumps are not permanently broken.
+
+def _record_device_event(
+    tensor_refs: Dict[str, "torch.Tensor"],
+) -> Optional[Any]:
+    """Record a current-stream event on whatever accelerator is in use.
+
+    Uses ``getattr(torch, device_type).Event()`` — portable to CUDA, XPU,
+    and any PyTorch device that follows the standard device-module convention.
+    Returns None for CPU-only tensors or devices that don't support events.
     """
-    lock = _get_json_lock(json_path)
-    with lock:
-        data: Dict[str, Any] = {}
-        if os.path.exists(json_path):
+    for t in tensor_refs.values():
+        if t.device.type == "cpu":
+            continue
+        device_mod = getattr(torch, t.device.type, None)
+        if device_mod is not None and hasattr(device_mod, "Event"):
             try:
-                with open(json_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except (json.JSONDecodeError, OSError) as exc:
-                logger.warning(
-                    f"Corrupt or unreadable JSON '{json_path}': {exc}. "
-                    "Starting fresh."
-                )
-                data = {}
-        data[key] = value
-        tmp_path = json_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp_path, json_path)
+                ev = device_mod.Event()
+                ev.record()
+                return ev
+            except Exception:
+                pass
+        break
+    return None
+
+
+def _extract_tensor_refs(
+    args: tuple, kwargs: dict, *, is_output: bool = False
+) -> Dict[str, "torch.Tensor"]:
+    """Extract detached tensor references using the same key scheme as ``_dump_input`` / ``_dump_output`` metadata."""
+    refs: Dict[str, torch.Tensor] = {}
+    if is_output:
+        result = args[0] if args else None
+        if isinstance(result, tuple):
+            for i, v in enumerate(result):
+                if isinstance(v, torch.Tensor):
+                    refs[f"result_{i}"] = v.detach()
+        elif isinstance(result, torch.Tensor):
+            refs["result"] = result.detach()
+    else:
+        for i, arg in enumerate(args):
+            if isinstance(arg, torch.Tensor):
+                refs[f"arg_{i}"] = arg.detach()
+        for k, v in kwargs.items():
+            if isinstance(v, torch.Tensor):
+                refs[f"kwarg_{k}"] = v.detach()
+    return refs
+
+
+def _get_or_open_handle(json_path: str) -> "_WipHandle":
+    """Return the ``_WipHandle`` for *json_path*, opening it if necessary."""
+    with _open_files_lock:
+        if json_path not in _open_file_handles:
+            fh = open(json_path, "a", encoding="utf-8")  # noqa: WPS515
+            _open_file_handles[json_path] = _WipHandle(fh)
+        return _open_file_handles[json_path]
+
+
+def _bg_compute_and_write(
+    json_path: str,
+    call_num: int,
+    meta_skeleton: Dict[str, Any],
+    tensor_refs: Dict[str, "torch.Tensor"],
+    device_event: Optional[Any],
+) -> None:
+    """Background: sync device stream, compute tensor stats, append JSON line.
+
+    Lines are written to *json_path* in ascending ``call_num`` order even when
+    background tasks complete out of order.  A small per-file reorder buffer
+    holds at most ``max_workers`` entries at a time (effectively O(1)).
+    """
+    if device_event is not None:
+        device_event.synchronize()
+    tensors_meta: Dict[str, Any] = {}
+    for k, t in tensor_refs.items():
+        try:
+            tensors_meta[k] = tensor_stats(t)
+        except Exception:
+            pass
+    meta_skeleton["tensors"] = tensors_meta
+
+    call_key = f"call_{call_num}"
+    line = json.dumps({call_key: meta_skeleton}, ensure_ascii=False) + "\n"
+    handle = _get_or_open_handle(json_path)
+    with handle.lock:
+        handle.pending[call_num] = line
+        while handle.next_write in handle.pending:
+            handle.fh.write(handle.pending.pop(handle.next_write))
+            handle.next_write += 1
+        handle.fh.flush()
+
+
+def _bg_save_pt(
+    args: tuple,
+    kwargs: dict,
+    *,
+    is_output: bool,
+    pt_path: str,
+    device_event: Optional[Any],
+) -> None:
+    """Background: sync device stream, serialize tensors to CPU, save .pt."""
+    if device_event is not None:
+        device_event.synchronize()
+    torch.save(_build_data(args, kwargs, is_output=is_output), pt_path)
+
+
+def _close_open_files() -> None:
+    """Close all open JSON Lines file handles at step end."""
+    with _open_files_lock:
+        handles = dict(_open_file_handles)
+        _open_file_handles.clear()
+    for handle in handles.values():
+        try:
+            handle.fh.flush()
+            handle.fh.close()
+        except OSError:
+            pass
+
+
+def _wait_and_flush() -> None:
+    """Drain all background futures, then close open file handles."""
+    with _pending_lock:
+        pending = list(_pending_futures)
+        _pending_futures.clear()
+    if pending:
+        concurrent.futures.wait(pending)
+    _close_open_files()
 
 
 # ── Dump I/O ──
@@ -551,18 +643,11 @@ def _dump_input(op_name: str, args: tuple, kwargs: dict,
                 module_tag: str = "",
                 op_tag: str = "",
                 dispatch_keys: Optional[List[Tuple[str, str, bool]]] = None) -> None:
-    """Save operator inputs to disk.
+    """Queue operator inputs for async stats computation and JSON buffering.
 
-    Appends an entry to the merged ``input.json`` (keyed by call number)
-    and optionally writes a per-call ``call_<N>_input.pt``.
-
-    Args:
-        op_name: Raw op name, used as pairing key.
-        exec_order: Pre-allocated execution order.  *None* → allocate internally.
-        label: Display label (may include module info) for metadata.
-        module_tag: Structured module tag, e.g. ``"Linear:model.layers.0.self_attn.q_proj"``.
-        op_tag: Op counter tag string, e.g. ``[op=3,2]``.
-        dispatch_keys: Full list of ``(key, impl, is_default)`` triples.
+    Records a device stream event in the main thread, then submits background
+    tasks to compute tensor statistics and buffer the JSON entry.  Optionally
+    queues a ``.pt`` save task when ``_with_values`` is enabled.
     """
     display = label or op_name
     try:
@@ -573,11 +658,10 @@ def _dump_input(op_name: str, args: tuple, kwargs: dict,
 
         _record_op_summary(op_name, dispatch_keys)
         _push_pairing(op_name, call_num, order, op_dir, label=display,
-                      module_tag=module_tag, op_tag=op_tag,
-                      dispatch_keys=dispatch_keys)
+                      module_tag=module_tag, op_tag=op_tag)
 
         call_key = f"call_{call_num}"
-        meta_entry: Dict[str, Any] = {
+        meta_skeleton: Dict[str, Any] = {
             "op_name": op_name,
             "exec_order": order,
             "call_num": call_num,
@@ -585,36 +669,38 @@ def _dump_input(op_name: str, args: tuple, kwargs: dict,
             "rank": get_rank(),
             "module_tag": module_tag,
             "op_tag": op_tag,
-            "dispatch_keys": _format_dispatch_keys_for_json(dispatch_keys) if dispatch_keys else "",
-            "tensors": _build_meta(args, kwargs),
         }
-        _append_to_json(os.path.join(op_dir, "input.json"), call_key, meta_entry)
+        tensor_refs = _extract_tensor_refs(args, kwargs)
+        device_event = _record_device_event(tensor_refs)
+        json_path = os.path.join(op_dir, "input.json")
+        _submit_bg(_bg_compute_and_write, json_path, call_num,
+                   meta_skeleton, tensor_refs, device_event)
 
-        if not _meta_only:
+        if _with_values:
             pt_path = os.path.join(op_dir, f"call_{call_num}_input.pt")
-            torch.save(_build_data(args, kwargs), pt_path)
+            _submit_bg(_bg_save_pt, args, kwargs,
+                       is_output=False, pt_path=pt_path, device_event=device_event)
 
-        logger.debug(f"Dumped input: {op_dir} [{call_key}]")
+        logger.debug(f"Queued input dump: {op_dir} [{call_key}]")
     except Exception as e:
-        logger.warning(f"Failed to dump input for '{display}': {e}")
+        logger.warning(f"Failed to queue input dump for '{display}': {e}")
 
 
 def _dump_output(op_name: str, result: Any) -> None:
-    """Save operator outputs to disk.
+    """Queue operator outputs for async stats computation and JSON buffering.
 
-    Appends an entry to the merged ``output.json`` (keyed by call number)
-    and optionally writes a per-call ``call_<N>_output.pt``.
+    Mirrors ``_dump_input``: records a device stream event, submits background
+    tasks for stats/JSON buffering, and optionally queues a ``.pt`` save.
     """
     try:
         pairing = _pop_pairing(op_name)
         if pairing is None:
             logger.warning(f"No pairing info for dump output '{op_name}', skipping")
             return
-        (call_num, order, op_dir, label, module_tag, op_tag,
-         dispatch_keys) = pairing
+        (call_num, order, op_dir, label, module_tag, op_tag) = pairing
 
         call_key = f"call_{call_num}"
-        meta_entry: Dict[str, Any] = {
+        meta_skeleton: Dict[str, Any] = {
             "op_name": op_name,
             "exec_order": order,
             "call_num": call_num,
@@ -622,18 +708,21 @@ def _dump_output(op_name: str, result: Any) -> None:
             "rank": get_rank(),
             "module_tag": module_tag,
             "op_tag": op_tag,
-            "dispatch_keys": _format_dispatch_keys_for_json(dispatch_keys) if dispatch_keys else "",
-            "tensors": _build_meta((result,), {}, is_output=True),
         }
-        _append_to_json(os.path.join(op_dir, "output.json"), call_key, meta_entry)
+        tensor_refs = _extract_tensor_refs((result,), {}, is_output=True)
+        device_event = _record_device_event(tensor_refs)
+        json_path = os.path.join(op_dir, "output.json")
+        _submit_bg(_bg_compute_and_write, json_path, call_num,
+                   meta_skeleton, tensor_refs, device_event)
 
-        if not _meta_only:
+        if _with_values:
             pt_path = os.path.join(op_dir, f"call_{call_num}_output.pt")
-            torch.save(_build_data((result,), {}, is_output=True), pt_path)
+            _submit_bg(_bg_save_pt, (result,), {},
+                       is_output=True, pt_path=pt_path, device_event=device_event)
 
-        logger.debug(f"Dumped output: {op_dir} [{call_key}]")
+        logger.debug(f"Queued output dump: {op_dir} [{call_key}]")
     except Exception as e:
-        logger.warning(f"Failed to dump output for '{op_name}': {e}")
+        logger.warning(f"Failed to queue output dump for '{op_name}': {e}")
 
 
 # ── Public API ──
@@ -642,6 +731,31 @@ def _dump_output(op_name: str, result: Any) -> None:
 def is_dump_enabled() -> bool:
     """Check if IO dumping is enabled (fast path)."""
     return _enabled
+
+
+def advance_io_step() -> None:
+    """Advance the step counter if IO dumping is enabled.
+
+    Called from model_runner after each inference cycle (forward + sampling).
+    No-op when dumping is disabled — safe to call unconditionally.
+    """
+    if _enabled:
+        advance_step()
+
+
+def init_io_dump_from_env(eager: bool) -> None:
+    """Initialize IO dumper from environment variables (called from model_runner).
+
+    Checks eager mode, detects env/yaml config, parses it, and activates hooks.
+    No-op when IO is not configured or when not in eager mode.
+    """
+    if _enabled or not eager:
+        return
+    if not (any(k.startswith("VLLM_FL_IO_DUMP") for k in os.environ)
+            or os.environ.get("VLLM_FL_CONFIG", "").strip()):
+        return
+    _init_from_env()   # sets _enabled = True, parses config
+    _activate_hooks()  # registers step callback, enters dispatch modes
 
 
 def dump_before(op_name: str, args: tuple, kwargs: dict,
@@ -665,7 +779,7 @@ def dump_before(op_name: str, args: tuple, kwargs: dict,
         return
 
     # Summary-only mode: just record the op for summary, skip per-op dump
-    if _summary_only:
+    if not _with_metas:
         record_seen(op_name, args)
         _record_op_summary(op_name, None)
         return
@@ -700,7 +814,7 @@ def dump_after(op_name: str, args: tuple, result: Any) -> None:
         return
     if not _should_dump(op_name, args):
         return
-    if _summary_only:
+    if not _with_metas:
         return
     set_guard(True)
     try:
@@ -749,11 +863,12 @@ def enable_io_dump(
     layers=_UNSET,
     max_calls=_UNSET,
     step_range=_UNSET,
-    torch_funcs=_UNSET,
+    with_torch_funcs=_UNSET,
     ranks=_UNSET,
-    meta_only=_UNSET,
-    summary_only=_UNSET,
-    print_io=_UNSET,
+    with_values=_UNSET,
+    with_metas=_UNSET,
+    with_print=_UNSET,
+    bg_workers=_UNSET,
 ) -> None:
     """
     Programmatically enable IO dumping (and optionally console printing).
@@ -779,25 +894,23 @@ def enable_io_dump(
         max_calls: Max calls per op to dump.  Unset/``0`` = unlimited.
         step_range: Inclusive step range string.  ``"0-2"`` means
             steps 0, 1, 2.  Unset/``None`` = all steps.
-        torch_funcs: Intercept bare torch functional ops via
+        with_torch_funcs: Intercept bare torch functional ops via
             TorchFunctionMode (eager mode only).  Unset → ``False``.
         ranks: Set of ranks to dump on.  Unset/``None`` = all ranks.
-        meta_only: If True, only write ``.json`` metadata files,
-            skip ``.pt`` tensor data files.  Unset → ``True``.
-        summary_only: If True, only collect op names for
-            ``summary.json`` without writing per-op input/output files.
-            Unset → ``False`` (API path) or ``True`` (env-var-only path).
-        print_io: If True, enable console logging of operator
-            inputs/outputs alongside file dumping.  Unset → ``False``.
+        with_values: If True, write per-call ``.pt`` tensor data files.
+            Unset → ``False``.
+        with_metas: If True, write per-op input/output ``.json`` files.
+            When False, only ``summary.json`` is written.  Unset → ``False``.
+        with_print: If True, enable console logging of operator
+            inputs/outputs.  Unset → ``False``.
+        bg_workers: Number of background threads for stats/I/O work.
+            Unset → ``8`` (or ``VLLM_FL_IO_DUMP_BG_WORKERS`` env var).
     """
     global _enabled, _dump_dir, _match_all, _op_filter, _module_filter, _layer_filter
-    global _max_calls, _step_range, _torch_funcs_enabled, _torch_func_filter, _meta_only
-    global _rank_filter, _summary_only, _print_enabled
+    global _max_calls, _step_range, _torch_funcs_enabled, _torch_func_filter, _with_values
+    global _rank_filter, _with_metas, _print_enabled, _bg_workers
 
     # ── Layer 0: defaults ──
-    # When calling the API explicitly, default summary_only=False so per-op
-    # dumps are produced.  The _init_from_env() path (auto-init during
-    # load_model) independently defaults to True for lightweight operation.
     r_dump_dir = os.path.join(os.getcwd(), "io_dump")
     r_ops: Optional[Set[str]] = None
     r_modules: Optional[Set[str]] = None
@@ -806,9 +919,10 @@ def enable_io_dump(
     r_step_range: Optional[Tuple[int, int]] = None  # half-open tuple
     r_torch_funcs = False
     r_ranks: Optional[Set[int]] = None
-    r_meta_only = True
-    r_summary_only = False
+    r_with_values = False
+    r_with_metas = False
     r_print_io = False
+    r_bg_workers = 8
 
     # ── Layer 1: env vars ──
     env_dump_dir = os.environ.get("VLLM_FL_IO_DUMP", "").strip()
@@ -841,7 +955,7 @@ def enable_io_dump(
         r_step_range = env_sr
 
     r_torch_func_filter: Set[str] = set()
-    env_tf = os.environ.get("VLLM_FL_IO_DUMP_TORCH_FUNCS", "").strip()
+    env_tf = os.environ.get("VLLM_FL_IO_DUMP_WITH_TORCH_FUNCS", "").strip()
     if env_tf:
         r_torch_funcs, r_torch_func_filter = parse_torch_funcs_config(env_tf)
 
@@ -849,23 +963,24 @@ def enable_io_dump(
     if env_rank:
         r_ranks = parse_rank_filter(env_rank)
 
-    env_meta = os.environ.get("VLLM_FL_IO_DUMP_META_ONLY", "").strip().lower()
-    if env_meta in ("0", "false"):
-        r_meta_only = False
-    elif env_meta in ("1", "true"):
-        r_meta_only = True
+    if os.environ.get("VLLM_FL_IO_DUMP_WITH_VALUES", "").strip().lower() in ("1", "true"):
+        r_with_values = True
 
-    env_so = os.environ.get("VLLM_FL_IO_DUMP_SUMMARY_ONLY", "").strip().lower()
-    if env_so in ("1", "true"):
-        r_summary_only = True
-    elif env_so in ("0", "false"):
-        r_summary_only = False
+    if os.environ.get("VLLM_FL_IO_DUMP_WITH_METAS", "").strip().lower() in ("1", "true"):
+        r_with_metas = True
 
-    env_print = os.environ.get("VLLM_FL_IO_DUMP_PRINT", "").strip().lower()
+    env_print = os.environ.get("VLLM_FL_IO_DUMP_WITH_PRINT", "").strip().lower()
     if env_print in ("1", "true"):
         r_print_io = True
     elif env_print in ("0", "false"):
         r_print_io = False
+
+    env_bg_workers = os.environ.get("VLLM_FL_IO_DUMP_BG_WORKERS", "").strip()
+    if env_bg_workers:
+        try:
+            r_bg_workers = max(1, int(env_bg_workers))
+        except ValueError:
+            pass
 
     # ── Layer 2: YAML config ──
     config_path = os.environ.get("VLLM_FL_CONFIG", "").strip()
@@ -884,16 +999,16 @@ def enable_io_dump(
                 r_max_calls = io_cfg["max_calls"]
             if io_cfg.get("step_range") is not None:
                 r_step_range = io_cfg["step_range"]
-            if "torch_funcs" in io_cfg:
-                r_torch_funcs, r_torch_func_filter = io_cfg["torch_funcs"]
+            if "with_torch_funcs" in io_cfg:
+                r_torch_funcs, r_torch_func_filter = io_cfg["with_torch_funcs"]
             if io_cfg.get("ranks") is not None:
                 r_ranks = io_cfg["ranks"]
-            if "meta_only" in io_cfg:
-                r_meta_only = io_cfg["meta_only"]
-            if "summary_only" in io_cfg:
-                r_summary_only = io_cfg["summary_only"]
-            if "print" in io_cfg:
-                r_print_io = io_cfg["print"]
+            if "with_values" in io_cfg:
+                r_with_values = io_cfg["with_values"]
+            if "with_metas" in io_cfg:
+                r_with_metas = io_cfg["with_metas"]
+            if "with_print" in io_cfg:
+                r_print_io = io_cfg["with_print"]
 
     # ── Layer 3: API overrides (only when not _UNSET) ──
     if dump_dir is not _UNSET:
@@ -908,16 +1023,18 @@ def enable_io_dump(
         r_max_calls = max_calls
     if step_range is not _UNSET:
         r_step_range = parse_step_range(step_range) if isinstance(step_range, str) else step_range
-    if torch_funcs is not _UNSET:
-        r_torch_funcs = torch_funcs
+    if with_torch_funcs is not _UNSET:
+        r_torch_funcs = with_torch_funcs
     if ranks is not _UNSET:
         r_ranks = ranks
-    if meta_only is not _UNSET:
-        r_meta_only = meta_only
-    if summary_only is not _UNSET:
-        r_summary_only = summary_only
-    if print_io is not _UNSET:
-        r_print_io = print_io
+    if with_values is not _UNSET:
+        r_with_values = with_values
+    if with_metas is not _UNSET:
+        r_with_metas = with_metas
+    if with_print is not _UNSET:
+        r_print_io = with_print
+    if bg_workers is not _UNSET:
+        r_bg_workers = max(1, int(bg_workers))
 
     # If print-only (no explicit dump_dir), skip file I/O
     if r_print_io and dump_dir is _UNSET and not os.environ.get("VLLM_FL_IO_DUMP", "").strip():
@@ -948,10 +1065,11 @@ def enable_io_dump(
     _step_range = r_step_range
     _torch_funcs_enabled = r_torch_funcs
     _torch_func_filter = r_torch_func_filter
-    _meta_only = r_meta_only
-    _summary_only = r_summary_only
+    _with_values = r_with_values
+    _with_metas = r_with_metas
     _rank_filter = r_ranks
     _print_enabled = r_print_io
+    _bg_workers = r_bg_workers
     _enabled = True
     set_io_active(True)
     _activate_hooks()
@@ -962,7 +1080,7 @@ def enable_io_dump(
     _resolved_modules = _module_filter if not _match_all else None
     _set_env_vars(_dump_dir, _resolved_ops, _resolved_modules, _layer_filter,
                   _max_calls, _step_range, _torch_funcs_enabled, _rank_filter,
-                  _meta_only, _summary_only, _print_enabled)
+                  _with_values, _with_metas, _print_enabled)
 
     logger.info(
         f"IO Dump enabled: rank={get_rank()}, "
@@ -970,14 +1088,14 @@ def enable_io_dump(
         f"ops={_op_filter or 'all'}, modules={_module_filter or 'all'}, "
         f"layers={_layer_filter or 'all'}, "
         f"max_calls={_max_calls}, step_range={_step_range}, "
-        f"torch_funcs={_torch_funcs_enabled}, meta_only={_meta_only}, "
-        f"summary_only={_summary_only}, print={_print_enabled}"
+        f"with_torch_funcs={_torch_funcs_enabled}, with_values={_with_values}, "
+        f"with_metas={_with_metas}, with_print={_print_enabled}"
     )
-    warn_if_not_eager("IO_DUMP")
 
 
 def disable_io_dump() -> None:
     """Programmatically disable IO dumping and remove all hooks."""
+    _wait_and_flush()
     _write_summary()
     _reset_state()
     _deactivate_hooks()
@@ -997,8 +1115,8 @@ def _set_env_vars(
     step_range: Optional[Tuple[int, int]],
     torch_funcs: bool,
     ranks: Optional[Set[int]],
-    meta_only: bool,
-    summary_only: bool,
+    with_values: bool,
+    with_metas: bool,
     print_on: bool = False,
 ) -> None:
     """Set VLLM_FL_IO_DUMP* env vars so child processes inherit the resolved config."""
@@ -1029,21 +1147,30 @@ def _set_env_vars(
     else:
         os.environ.pop("VLLM_FL_IO_DUMP_STEP_RANGE", None)
 
-    os.environ["VLLM_FL_IO_DUMP_TORCH_FUNCS"] = "1" if torch_funcs else "0"
+    if torch_funcs:
+        os.environ["VLLM_FL_IO_DUMP_WITH_TORCH_FUNCS"] = "1"
+    else:
+        os.environ.pop("VLLM_FL_IO_DUMP_WITH_TORCH_FUNCS", None)
 
     if ranks is not None:
         os.environ["VLLM_FL_IO_DUMP_RANK"] = ",".join(str(r) for r in sorted(ranks))
     else:
         os.environ.pop("VLLM_FL_IO_DUMP_RANK", None)
 
-    os.environ["VLLM_FL_IO_DUMP_META_ONLY"] = "1" if meta_only else "0"
-
-    if summary_only:
-        os.environ["VLLM_FL_IO_DUMP_SUMMARY_ONLY"] = "1"
+    if with_values:
+        os.environ["VLLM_FL_IO_DUMP_WITH_VALUES"] = "1"
     else:
-        os.environ["VLLM_FL_IO_DUMP_SUMMARY_ONLY"] = "0"
+        os.environ.pop("VLLM_FL_IO_DUMP_WITH_VALUES", None)
 
-    os.environ["VLLM_FL_IO_DUMP_PRINT"] = "1" if print_on else "0"
+    if with_metas:
+        os.environ["VLLM_FL_IO_DUMP_WITH_METAS"] = "1"
+    else:
+        os.environ.pop("VLLM_FL_IO_DUMP_WITH_METAS", None)
+
+    if print_on:
+        os.environ["VLLM_FL_IO_DUMP_WITH_PRINT"] = "1"
+    else:
+        os.environ.pop("VLLM_FL_IO_DUMP_WITH_PRINT", None)
 
 
 def _clear_env_vars() -> None:
@@ -1051,9 +1178,9 @@ def _clear_env_vars() -> None:
     for key in [
         "VLLM_FL_IO_DUMP", "VLLM_FL_IO_DUMP_OPS", "VLLM_FL_IO_DUMP_MODULES",
         "VLLM_FL_IO_DUMP_LAYERS", "VLLM_FL_IO_DUMP_MAX_CALLS",
-        "VLLM_FL_IO_DUMP_STEP_RANGE", "VLLM_FL_IO_DUMP_TORCH_FUNCS",
-        "VLLM_FL_IO_DUMP_META_ONLY", "VLLM_FL_IO_DUMP_RANK",
-        "VLLM_FL_IO_DUMP_SUMMARY_ONLY", "VLLM_FL_IO_DUMP_PRINT",
+        "VLLM_FL_IO_DUMP_STEP_RANGE", "VLLM_FL_IO_DUMP_RANK",
+        "VLLM_FL_IO_DUMP_WITH_TORCH_FUNCS", "VLLM_FL_IO_DUMP_WITH_VALUES",
+        "VLLM_FL_IO_DUMP_WITH_METAS", "VLLM_FL_IO_DUMP_WITH_PRINT",
     ]:
         os.environ.pop(key, None)
 
@@ -1179,7 +1306,7 @@ if HAS_TORCH_DISPATCH_MODE:
                     return func(*args, **kwargs)
 
             # Summary-only mode: just record the op for summary.json
-            if _summary_only:
+            if not _with_metas:
                 ns = get_dispatch_op_namespace(func)
                 raw_name = f"{ns}.{op_name}"
                 dispatch_keys = get_dispatch_keys(func, args, kwargs)
@@ -1187,28 +1314,17 @@ if HAS_TORCH_DISPATCH_MODE:
                 record_seen(raw_name)
                 return func(*args, **kwargs)
 
-            # Only walk the call stack when layer/module filters are active
-            if _layer_filter or (_module_filter and not _match_all):
-                module_ctx = get_module_context_from_stack()
+            # Layer filter check
+            if _layer_filter and not layer_path_matches(_layer_filter):
+                return func(*args, **kwargs)
 
-                # Layer filter check
-                if _layer_filter and not layer_path_matches_from_stack(
-                    _layer_filter, module_ctx
-                ):
+            # Module filter check
+            if _module_filter and not _match_all:
+                if not module_context_matches(_module_filter):
                     return func(*args, **kwargs)
 
-                # Module filter check
-                if _module_filter and not _match_all:
-                    if not module_context_matches_from_stack(
-                        _module_filter, module_ctx
-                    ):
-                        return func(*args, **kwargs)
-
-                mod_name = module_ctx[0][0] if module_ctx else ""
-                mod_path = module_ctx[0][1] if module_ctx else ""
-            else:
-                mod_name = ""
-                mod_path = ""
+            mod_name = get_current_module() or ""
+            mod_path = get_current_module_path() or ""
 
             ns = get_dispatch_op_namespace(func)
             raw_name = f"{ns}.{op_name}"
@@ -1217,8 +1333,7 @@ if HAS_TORCH_DISPATCH_MODE:
 
             dispatch_keys = get_dispatch_keys(func, args, kwargs)
             label = make_label(raw_name, module_name=mod_name or None,
-                               layer_path=mod_path or None,
-                               dispatch_keys=dispatch_keys)
+                               layer_path=mod_path or None)
             order = next_exec_order()
             module_tag = make_module_tag_from_ctx(mod_name, mod_path, for_json=True)
             op_tag = make_op_tag(raw_name)
@@ -1267,25 +1382,20 @@ if HAS_TORCH_FUNC_MODE:
             func_name = get_torch_func_name(func)
 
             # Summary-only mode: just record and pass through
-            if _summary_only:
+            if not _with_metas:
                 raw_name = f"torch.{func_name}"
                 record_seen(raw_name)
                 return func(*args, **kwargs)
 
-            # Only walk stack when layer/module filters are active
-            if _layer_filter or (_module_filter and not _match_all):
-                module_ctx = get_module_context_from_stack()
-            else:
-                module_ctx = None
-            if not _should_dump_torch_func(func_name, module_ctx):
+            if not _should_dump_torch_func(func_name):
                 return func(*args, **kwargs)
 
             # Use raw name for pairing/limits, annotated label for metadata
             raw_name = f"torch.{func_name}"
             if not _check_limits(raw_name):
                 return func(*args, **kwargs)
-            mod_name = module_ctx[0][0] if module_ctx else ""
-            mod_path = module_ctx[0][1] if module_ctx else ""
+            mod_name = get_current_module() or ""
+            mod_path = get_current_module_path() or ""
             label = make_label(raw_name, module_name=mod_name or None,
                                layer_path=mod_path or None)
             _, op_tag, order = acquire_torch_func_tags(raw_name)
@@ -1332,9 +1442,7 @@ def _enter_dispatch_modes():
     """Enter dispatch/function modes via the shared ModeManager."""
     if HAS_TORCH_DISPATCH_MODE:
         dispatch_mode_mgr.enter("dump", _DumpDispatchMode())
-
-    eager = _is_eager_mode()
-    if eager and _torch_funcs_enabled and HAS_TORCH_FUNC_MODE:
+    if _torch_funcs_enabled and HAS_TORCH_FUNC_MODE:
         func_mode_mgr.enter("dump", _DumpTorchFuncMode())
 
 
@@ -1365,6 +1473,41 @@ def resume_dispatch_modes():
         _enter_dispatch_modes()
 
 
+def register_io_module_hooks(model: torch.nn.Module) -> None:
+    """Register module paths and install forward hooks for thread-local context.
+
+    Builds the ``id(module) → path`` map (needed by ``get_module_path`` and
+    ``push_module_context``) then installs pre/post forward hooks on every
+    module so that ``get_current_module`` / ``get_current_module_path`` return
+    the correct values inside ``__torch_dispatch__``.
+
+    No-op when IO dumping is not enabled.
+    Safe to call multiple times — removes any previously installed handles first.
+    Must be called after the model is fully constructed.
+    """
+    if not _enabled:
+        return
+    register_module_paths(model)
+    _remove_module_hooks()
+    for module in model.modules():
+        cls_name = type(module).__name__
+        h_pre = module.register_forward_pre_hook(
+            lambda m, _args, cls=cls_name: push_module_context(cls, m)
+        )
+        h_post = module.register_forward_hook(
+            lambda _m, _args, _out: pop_module_context()
+        )
+        _module_hook_handles.append(h_pre)
+        _module_hook_handles.append(h_post)
+
+
+def _remove_module_hooks() -> None:
+    """Remove all module forward hooks installed by ``register_io_module_hooks``."""
+    for handle in _module_hook_handles:
+        handle.remove()
+    _module_hook_handles.clear()
+
+
 def _activate_hooks():
     """Activate TorchDispatchMode and optionally TorchFunctionMode."""
     global _hooks_activated
@@ -1382,20 +1525,8 @@ def _activate_hooks():
     _hooks_activated = True
 
 
-def maybe_activate_hooks() -> None:
-    """Activate hooks if IO dump is enabled but hooks are not yet entered.
-
-    Called from model_runner at the start of the first ``execute_model()``
-    to defer dispatch mode activation past the memory profiling phase.
-    When the programmatic API (``enable_io_dump()``) is used, hooks are
-    activated immediately and this is a no-op.
-    """
-    if _enabled and not _hooks_activated:
-        _activate_hooks()
-
-
 def _deactivate_hooks():
-    """Remove step callback and request exit of dispatch modes.
+    """Remove step callback, module forward hooks, and request exit of dispatch modes.
 
     The shared ``ModeManager`` handles LIFO ordering — modes are only
     actually exited when they are on top of the stack.
@@ -1403,6 +1534,7 @@ def _deactivate_hooks():
     global _hooks_activated
 
     unregister_step_callback(_on_step_advance)
+    _remove_module_hooks()
     _exit_dispatch_modes()
     _hooks_activated = False
 
@@ -1413,9 +1545,9 @@ def _deactivate_hooks():
 def _reset_state() -> None:
     """Reset all module-level state to defaults."""
     global _enabled, _dump_dir, _match_all, _op_filter, _module_filter, _layer_filter
-    global _max_calls, _step_range, _meta_only, _summary_only
+    global _max_calls, _step_range, _with_values, _with_metas
     global _torch_funcs_enabled, _torch_func_filter, _rank_filter
-    global _print_enabled
+    global _print_enabled, _io_executor, _bg_workers
 
     _enabled = False
     _dump_dir = ""
@@ -1425,30 +1557,44 @@ def _reset_state() -> None:
     _layer_filter = set()
     _max_calls = 0
     _step_range = None
-    _meta_only = True
-    _summary_only = False
+    _with_values = False
+    _with_metas = False
     _torch_funcs_enabled = False
     _torch_func_filter = set()
     _rank_filter = None
     _print_enabled = False
+    _bg_workers = 8
     with _lock:
         _call_counters.clear()
         _op_summary.clear()
+    # Shutdown background executor and clear async state
+    exec_ = _io_executor
+    _io_executor = None
+    if exec_ is not None and not exec_._shutdown:
+        exec_.shutdown(wait=False)
+    with _pending_lock:
+        _pending_futures.clear()
+    with _open_files_lock:
+        for handle in _open_file_handles.values():
+            try:
+                handle.fh.close()
+            except OSError:
+                pass
+        _open_file_handles.clear()
 
 
 def _init_from_env() -> None:
     """Initialize from environment variables and/or YAML config.
 
-    Uses a 2-layer merge (env < yaml) — the same strategy as
-    ``enable_io_dump()`` but without the API layer, and with
-    deferred dispatch-mode activation.
+    Uses a 2-layer merge (env < yaml) — the same config strategy as
+    ``enable_io_dump()`` but without the API layer.
 
     Skipped when the programmatic API (``enable_io_dump``) has already
     been called — the Python API has the highest priority.
     """
     global _enabled, _dump_dir, _match_all, _op_filter, _module_filter, _layer_filter
-    global _max_calls, _step_range, _torch_funcs_enabled, _torch_func_filter, _meta_only
-    global _rank_filter, _summary_only, _print_enabled
+    global _max_calls, _step_range, _torch_funcs_enabled, _torch_func_filter, _with_values
+    global _rank_filter, _with_metas, _print_enabled
 
     if _enabled:
         return
@@ -1466,7 +1612,7 @@ def _init_from_env() -> None:
             yaml_enabled = bool(yaml_cfg.get("dir"))
 
     # Check if print-only mode is requested via env
-    env_print_val = os.environ.get("VLLM_FL_IO_DUMP_PRINT", "").strip().lower()
+    env_print_val = os.environ.get("VLLM_FL_IO_DUMP_WITH_PRINT", "").strip().lower()
     _env_print_requested = env_print_val in ("1", "true")
 
     if env_dump_dir == "0":
@@ -1495,8 +1641,8 @@ def _init_from_env() -> None:
     r_torch_funcs = False
     r_torch_func_filter: Set[str] = set()
     r_ranks: Optional[Set[int]] = None
-    r_meta_only = True
-    r_summary_only = True  # lightweight default for env/auto-init path
+    r_with_values = False
+    r_with_metas = False
     r_print_io = False
 
     # ── Layer 1: env vars ──
@@ -1527,7 +1673,7 @@ def _init_from_env() -> None:
     if env_sr is not None:
         r_step_range = env_sr
 
-    env_tf = os.environ.get("VLLM_FL_IO_DUMP_TORCH_FUNCS", "").strip()
+    env_tf = os.environ.get("VLLM_FL_IO_DUMP_WITH_TORCH_FUNCS", "").strip()
     if env_tf:
         r_torch_funcs, r_torch_func_filter = parse_torch_funcs_config(env_tf)
 
@@ -1535,19 +1681,13 @@ def _init_from_env() -> None:
     if env_rank:
         r_ranks = parse_rank_filter(env_rank)
 
-    env_meta = os.environ.get("VLLM_FL_IO_DUMP_META_ONLY", "").strip().lower()
-    if env_meta in ("0", "false"):
-        r_meta_only = False
-    elif env_meta in ("1", "true"):
-        r_meta_only = True
+    if os.environ.get("VLLM_FL_IO_DUMP_WITH_VALUES", "").strip().lower() in ("1", "true"):
+        r_with_values = True
 
-    env_so = os.environ.get("VLLM_FL_IO_DUMP_SUMMARY_ONLY", "").strip().lower()
-    if env_so in ("0", "false"):
-        r_summary_only = False
-    elif env_so in ("1", "true"):
-        r_summary_only = True
+    if os.environ.get("VLLM_FL_IO_DUMP_WITH_METAS", "").strip().lower() in ("1", "true"):
+        r_with_metas = True
 
-    env_print_new = os.environ.get("VLLM_FL_IO_DUMP_PRINT", "").strip().lower()
+    env_print_new = os.environ.get("VLLM_FL_IO_DUMP_WITH_PRINT", "").strip().lower()
     if env_print_new in ("1", "true"):
         r_print_io = True
     elif env_print_new in ("0", "false"):
@@ -1567,16 +1707,16 @@ def _init_from_env() -> None:
             r_max_calls = yaml_cfg["max_calls"]
         if yaml_cfg.get("step_range") is not None:
             r_step_range = yaml_cfg["step_range"]
-        if "torch_funcs" in yaml_cfg:
-            r_torch_funcs, r_torch_func_filter = yaml_cfg["torch_funcs"]
+        if "with_torch_funcs" in yaml_cfg:
+            r_torch_funcs, r_torch_func_filter = yaml_cfg["with_torch_funcs"]
         if yaml_cfg.get("ranks") is not None:
             r_ranks = yaml_cfg["ranks"]
-        if "meta_only" in yaml_cfg:
-            r_meta_only = yaml_cfg["meta_only"]
-        if "summary_only" in yaml_cfg:
-            r_summary_only = yaml_cfg["summary_only"]
-        if "print" in yaml_cfg:
-            r_print_io = yaml_cfg["print"]
+        if "with_values" in yaml_cfg:
+            r_with_values = yaml_cfg["with_values"]
+        if "with_metas" in yaml_cfg:
+            r_with_metas = yaml_cfg["with_metas"]
+        if "with_print" in yaml_cfg:
+            r_print_io = yaml_cfg["with_print"]
 
     # ── Apply resolved config ──
     # For print-only mode (no dump_dir), skip directory creation
@@ -1611,18 +1751,13 @@ def _init_from_env() -> None:
     _step_range = r_step_range
     _torch_funcs_enabled = r_torch_funcs
     _torch_func_filter = r_torch_func_filter
-    _meta_only = r_meta_only
-    _summary_only = r_summary_only
+    _with_values = r_with_values
+    _with_metas = r_with_metas
     _rank_filter = r_ranks
     _print_enabled = r_print_io
 
     _enabled = True
     set_io_active(True)
-
-    # Register step callback but defer dispatch mode activation
-    # to maybe_activate_hooks() (called from model_runner before the
-    # first execute_model).
-    register_step_callback(_on_step_advance)
 
     logger.info(
         f"IO Dump enabled (env/yaml): rank={get_rank()}, "
@@ -1631,6 +1766,6 @@ def _init_from_env() -> None:
         f"ops={_op_filter or 'all'}, modules={_module_filter or 'all'}, "
         f"layers={_layer_filter or 'all'}, "
         f"max_calls={_max_calls}, step_range={_step_range}, "
-        f"torch_funcs={_torch_funcs_enabled}, meta_only={_meta_only}, "
-        f"summary_only={_summary_only}, print={_print_enabled}"
+        f"with_torch_funcs={_torch_funcs_enabled}, with_values={_with_values}, "
+        f"with_metas={_with_metas}, with_print={_print_enabled}"
     )

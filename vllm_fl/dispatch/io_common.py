@@ -41,32 +41,22 @@ except ImportError:
     HAS_TORCH_DISPATCH_MODE = False
 
 
-_io_active_count: int = 0
-_io_active_lock = threading.Lock()
+_io_active: bool = False
 
 
 def set_io_active(active: bool) -> None:
-    """Ref-counted IO-active flag used by the IO dumper.
+    """Set the IO-active flag used by managed_inference_mode.
 
-    Each ``True`` increments the active count; each ``False`` decrements
-    it (down to a minimum of zero).  ``is_io_active()`` returns True as
-    long as at least one subsystem is still active, so disabling one
-    subsystem does not break ``managed_inference_mode`` for the other.
-
-    Thread-safe: guarded by ``_io_active_lock`` since enable/disable
-    may be called from different threads.
+    When True, managed_inference_mode uses torch.no_grad() instead of
+    torch.inference_mode() so that TorchDispatchMode can intercept ops.
     """
-    global _io_active_count
-    with _io_active_lock:
-        if active:
-            _io_active_count += 1
-        else:
-            _io_active_count = max(0, _io_active_count - 1)
+    global _io_active
+    _io_active = active
 
 
 def is_io_active() -> bool:
-    """Return True if at least one IO subsystem (print or dump) is active."""
-    return _io_active_count > 0
+    """Return True if the IO dumper is active."""
+    return _io_active
 
 
 # ── Shared dispatch / function mode lifecycle ──
@@ -171,50 +161,6 @@ def managed_inference_mode():
         return wrapper
 
     return decorator
-
-
-_eager_mode_override: Optional[bool] = None
-
-
-def set_eager_mode(eager: bool) -> None:
-    """Explicitly set whether the model is running in eager mode.
-
-    Called by model_runner with the actual ``enforce_eager`` config value so
-    that IO hooks know whether torch.compile will be used *before* compilation
-    starts (runtime detection is unreliable at hook-registration time).
-    """
-    global _eager_mode_override
-    _eager_mode_override = eager
-
-
-def _is_eager_mode() -> bool:
-    """Check whether eager mode (no torch.compile) is active.
-
-    If ``set_eager_mode()`` was called (by model_runner), use that value.
-    Otherwise fall back to best-effort runtime detection.
-    """
-    if _eager_mode_override is not None:
-        return _eager_mode_override
-    # Fall back to checking the VLLM-specific env var / config hint
-    vllm_enforce = os.environ.get("VLLM_TORCH_COMPILE_LEVEL", "")
-    if vllm_enforce and vllm_enforce != "0":
-        return False
-    return True
-
-
-def warn_if_not_eager(subsystem: str) -> None:
-    """Log a hint if the model doesn't appear to be running in eager mode.
-
-    Called once when the dumper is enabled so users know
-    they can get more comprehensive interception with ``enforce_eager=True``.
-    """
-    if not _is_eager_mode():
-        _logger.warning(
-            "[%s] torch.compile detected. TorchDispatchMode is active for "
-            "ATen-level op interception. Use enforce_eager=True for "
-            "additional TorchFunctionMode interception.",
-            subsystem,
-        )
 
 
 # ── Distributed rank ──
@@ -1393,14 +1339,16 @@ def parse_io_config_from_yaml(config_path: str) -> Dict[str, Any]:
 
         io_dump:
           dir: /tmp/io_dump
-          print: true             # enable console logging
+          with_print: true        # enable console logging
           ops:
             - rms_norm
           modules:
             - Linear
           max_calls: 100
           step_range: "5-15"      # inclusive "start-end"
-          torch_funcs: true
+          with_torch_funcs: true
+          with_metas: true        # write per-op JSON files
+          with_values: true       # write per-call .pt files
 
     Returns:
         Dict with key "io_dump" containing parsed settings.
@@ -1466,16 +1414,16 @@ def _parse_dump_section(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     parsed["step_range"] = _parse_step_range_yaml(cfg)
 
-    # Only include torch_funcs when explicitly set in YAML so that
+    # Only include with_torch_funcs when explicitly set in YAML so that
     # _init_from_env can apply the match-all default for absent keys.
-    if "torch_funcs" in cfg:
-        parsed["torch_funcs"] = _parse_torch_funcs_yaml(cfg["torch_funcs"])
+    if "with_torch_funcs" in cfg:
+        parsed["with_torch_funcs"] = _parse_torch_funcs_yaml(cfg["with_torch_funcs"])
     parsed["ranks"] = _parse_ranks_yaml(cfg.get("ranks"))
-    parsed["meta_only"] = bool(cfg.get("meta_only", True))
-    if "summary_only" in cfg:
-        parsed["summary_only"] = bool(cfg["summary_only"])
-    if "print" in cfg:
-        parsed["print"] = bool(cfg["print"])
+    parsed["with_values"] = bool(cfg.get("with_values", False))
+    if "with_metas" in cfg:
+        parsed["with_metas"] = bool(cfg["with_metas"])
+    if "with_print" in cfg:
+        parsed["with_print"] = bool(cfg["with_print"])
 
     return parsed
 

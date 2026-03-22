@@ -216,53 +216,13 @@ if TYPE_CHECKING:
 
 from vllm_fl.compilation.graph import GraphWrapper
 from vllm_fl.dispatch.io_common import managed_inference_mode
+from vllm_fl.dispatch.io_dumper import (
+    advance_io_step,
+    init_io_dump_from_env,
+    register_io_module_hooks,
+)
 
 logger = init_logger(__name__)
-
-# ── IO dump step tracking ──
-# Cached references resolved on first call; thereafter a single bool check
-# per execute_model call when IO features are disabled.
-_io_advance_step = None
-_io_dump_enabled = None
-_io_hooks_activated = False
-
-
-def _maybe_activate_io_hooks() -> None:
-    """Activate IO dispatch modes if not yet done (once per process).
-
-    ``_init_from_env()`` parses config and sets ``_enabled = True`` during
-    ``load_model()``, but defers dispatch mode activation so that the
-    modes don't interfere with vLLM's ``determine_available_memory()``.
-    This function enters the modes just before the first ``execute_model()``.
-
-    The flag is set only after successful activation so that a transient
-    failure does not permanently prevent retries on subsequent calls.
-    """
-    global _io_hooks_activated
-    if _io_hooks_activated:
-        return
-    try:
-        from vllm_fl.dispatch.io_dumper import maybe_activate_hooks as _act_dump
-        _act_dump()
-        _io_hooks_activated = True
-    except Exception as exc:
-        logger.warning("Failed to activate IO hooks: %s", exc, exc_info=True)
-
-
-def _maybe_advance_io_step() -> None:
-    """Advance the IO step counter if IO dump is active.
-
-    Lazy-imports on first call to avoid import-time overhead.
-    Subsequent calls cost one bool-check each when features are off.
-    """
-    global _io_advance_step, _io_dump_enabled
-    if _io_advance_step is None:
-        from vllm_fl.dispatch.io_common import advance_step
-        from vllm_fl.dispatch.io_dumper import is_dump_enabled
-        _io_advance_step = advance_step
-        _io_dump_enabled = is_dump_enabled
-    if _io_dump_enabled():
-        _io_advance_step()
 
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
@@ -692,7 +652,7 @@ class ModelRunnerFL(
         if self.mm_budget:
             self.mm_budget.reset_cache()
 
-    @torch.inference_mode()
+    @managed_inference_mode()
     def init_fp8_kv_scales(self) -> None:
         """
         Re-initialize the KV cache and FP8 scales after waking from sleep.
@@ -3392,7 +3352,7 @@ class ModelRunnerFL(
 
         # Advance IO step after the full inference cycle (forward + sampling)
         # so that one step encompasses both execute_model and sample_tokens.
-        _maybe_advance_io_step()
+        advance_io_step()
 
         ### TODO(lms): abstract async schedule for all hardware
         if not self.use_async_scheduling:
@@ -3655,20 +3615,10 @@ class ModelRunnerFL(
             self.eplb_state = EplbState(self.parallel_config, self.device)
             eplb_models = 0
 
-        # IO dumper: parse config and (in eager mode) activate dispatch hooks
-        # before model loading so init-time ops are captured.  In graph mode,
-        # hooks are deferred to the first execute_model() call because
-        # TorchDispatchMode alters torch.compile graph structure.
-        _io_requested = any(
-            k.startswith("VLLM_FL_IO_DUMP") for k in os.environ
-        ) or os.environ.get("VLLM_FL_CONFIG", "").strip()
-        if _io_requested:
-            from vllm_fl.dispatch.io_common import set_eager_mode
-            from vllm_fl.dispatch.io_dumper import _init_from_env as _init_dump
-            set_eager_mode(getattr(self.model_config, "enforce_eager", False))
-            _init_dump()
-            if getattr(self.model_config, "enforce_eager", False):
-                _maybe_activate_io_hooks()
+        # IO dumper is only supported in eager mode.  In graph mode (torch.compile)
+        # TorchDispatchMode and the module forward hooks are incompatible with
+        # Dynamo tracing, so IO dumping is silently skipped.
+        init_io_dump_from_env(getattr(self.model_config, "enforce_eager", False))
 
         try:
             with DeviceMemoryProfiler() as m:
@@ -3762,10 +3712,8 @@ class ModelRunnerFL(
             scope="local",
         )
 
-        # IO dumper: register module paths for layer-path filtering.
-        if _io_requested:
-            from vllm_fl.dispatch.io_common import register_module_paths
-            register_module_paths(self.model)
+        # IO dumper: register module paths and install module context hooks.
+        register_io_module_hooks(self.model)
 
         prepare_communication_buffer_for_model(self.model)
         if (drafter := getattr(self, "drafter", None)) and (
@@ -4073,7 +4021,7 @@ class ModelRunnerFL(
             )
         )
 
-    @torch.inference_mode()
+    @managed_inference_mode()
     def _dummy_run(
         self,
         num_tokens: int,
@@ -4370,7 +4318,7 @@ class ModelRunnerFL(
         )
         return hidden_states, hidden_states[logit_indices_device]
 
-    @torch.inference_mode()
+    @managed_inference_mode()
     def _dummy_sampler_run(
         self,
         hidden_states: torch.Tensor,
@@ -4501,7 +4449,7 @@ class ModelRunnerFL(
             else:
                 raise e
 
-    @torch.inference_mode()
+    @managed_inference_mode()
     def _dummy_pooler_run(
         self,
         hidden_states: torch.Tensor,

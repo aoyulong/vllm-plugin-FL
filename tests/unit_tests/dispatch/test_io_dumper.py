@@ -35,17 +35,20 @@ from vllm_fl.dispatch.io_common import (
 )
 from vllm_fl.dispatch.io_dumper import (
     _build_data,
-    _build_meta,
+    _extract_tensor_refs,
     _serialize_value,
     _should_dump,
     _should_dump_torch_func,
+    advance_io_step,
     disable_io_dump,
     dump_after,
     dump_before,
     dump_cleanup,
     enable_io_dump,
+    init_io_dump_from_env,
     io_dump_step,
     is_dump_enabled,
+    register_io_module_hooks,
 )
 
 
@@ -55,6 +58,17 @@ def dump_dir():
     d = tempfile.mkdtemp(prefix="vllm_fl_dump_test_")
     yield d
     shutil.rmtree(d, ignore_errors=True)
+
+
+def _read_jsonl(path: str) -> dict:
+    """Read a JSON Lines file (one JSON object per line) and merge into a dict."""
+    data: dict = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                data.update(json.loads(line))
+    return data
 
 
 class TestSerializeValue:
@@ -99,23 +113,23 @@ class TestSerializeValue:
 
 
 class TestBuildDicts:
-    """Test _build_meta and _build_data."""
+    """Test _extract_tensor_refs and _build_data key naming scheme."""
 
     def test_input_meta_args(self):
         t = torch.zeros(2, 3)
-        m = _build_meta((t, None, 1.0), {})
-        assert "arg_0" in m
-        assert m["arg_0"]["shape"] == [2, 3]
-        # Non-tensors are not in meta
-        assert "arg_1" not in m
-        assert "arg_2" not in m
+        refs = _extract_tensor_refs((t, None, 1.0), {})
+        assert "arg_0" in refs
+        assert refs["arg_0"].shape == torch.Size([2, 3])
+        # Non-tensors are not included
+        assert "arg_1" not in refs
+        assert "arg_2" not in refs
 
     def test_input_meta_kwargs(self):
         t = torch.ones(4)
-        m = _build_meta((), {"weight": t, "epsilon": 1e-6})
-        assert "kwarg_weight" in m
-        assert m["kwarg_weight"]["shape"] == [4]
-        assert "kwarg_epsilon" not in m
+        refs = _extract_tensor_refs((), {"weight": t, "epsilon": 1e-6})
+        assert "kwarg_weight" in refs
+        assert refs["kwarg_weight"].shape == torch.Size([4])
+        assert "kwarg_epsilon" not in refs
 
     def test_input_data_args(self):
         t = torch.zeros(2, 3)
@@ -132,16 +146,16 @@ class TestBuildDicts:
 
     def test_output_meta_single(self):
         t = torch.ones(4, 5)
-        m = _build_meta((t,), {}, is_output=True)
-        assert "result" in m
-        assert m["result"]["shape"] == [4, 5]
+        refs = _extract_tensor_refs((t,), {}, is_output=True)
+        assert "result" in refs
+        assert refs["result"].shape == torch.Size([4, 5])
 
     def test_output_meta_tuple(self):
         t1 = torch.zeros(2)
         t2 = torch.ones(3)
-        m = _build_meta(((t1, t2),), {}, is_output=True)
-        assert "result_0" in m
-        assert "result_1" in m
+        refs = _extract_tensor_refs(((t1, t2),), {}, is_output=True)
+        assert "result_0" in refs
+        assert "result_1" in refs
 
     def test_output_data_single(self):
         t = torch.ones(4, 5)
@@ -219,10 +233,11 @@ class TestDumpBeforeAfter:
         reset_step()
 
     def test_dump_creates_input_file(self, dump_dir):
-        enable_io_dump(dump_dir, meta_only=False, summary_only=False)
+        enable_io_dump(dump_dir, with_values=True, with_metas=True)
         reset_exec_order()
         t = torch.zeros(2, 3)
         dump_before("test_op", (t,), {"epsilon": 1e-6})
+        io_dumper._wait_and_flush()
 
         step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
         assert os.path.isdir(step_dir)
@@ -237,14 +252,13 @@ class TestDumpBeforeAfter:
         assert "__meta__" not in data
         # Check merged JSON meta file
         assert os.path.isfile(os.path.join(step_dir, "input.json"))
-        with open(os.path.join(step_dir, "input.json")) as f:
-            all_meta = json.load(f)
+        all_meta = _read_jsonl(os.path.join(step_dir, "input.json"))
         meta = all_meta["call_1"]
         assert "test_op" in meta["op_name"]
         assert meta["exec_order"] >= 1
 
     def test_dump_creates_output_file(self, dump_dir):
-        enable_io_dump(dump_dir, meta_only=False, summary_only=False)
+        enable_io_dump(dump_dir, with_values=True, with_metas=True)
         reset_exec_order()
         t_in = torch.zeros(2, 3)
         # Call dump_before first to set call counter
@@ -252,6 +266,7 @@ class TestDumpBeforeAfter:
 
         t_out = torch.ones(2, 3)
         dump_after("test_op", (t_in,), t_out)
+        io_dumper._wait_and_flush()
 
         step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
         assert os.path.isfile(os.path.join(step_dir, "call_1_output.pt"))
@@ -264,13 +279,12 @@ class TestDumpBeforeAfter:
         assert "__meta__" not in data
         # Check merged JSON meta file
         assert os.path.isfile(os.path.join(step_dir, "output.json"))
-        with open(os.path.join(step_dir, "output.json")) as f:
-            all_meta = json.load(f)
+        all_meta = _read_jsonl(os.path.join(step_dir, "output.json"))
         meta = all_meta["call_1"]
         assert "op_name" in meta
 
     def test_dump_tuple_output(self, dump_dir):
-        enable_io_dump(dump_dir, meta_only=False, summary_only=False)
+        enable_io_dump(dump_dir, with_values=True, with_metas=True)
         reset_exec_order()
         t_in = torch.zeros(2)
         dump_before("test_op", (t_in,), {})
@@ -278,6 +292,7 @@ class TestDumpBeforeAfter:
         t1 = torch.zeros(2)
         t2 = torch.ones(3)
         dump_after("test_op", (t_in,), (t1, t2))
+        io_dumper._wait_and_flush()
 
         step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
         assert os.path.isfile(os.path.join(step_dir, "call_1_output.pt"))
@@ -320,12 +335,13 @@ class TestIoDumpStep:
         assert io_dumper._call_counters == {}
 
     def test_dump_files_in_different_steps(self, dump_dir):
-        enable_io_dump(dump_dir, meta_only=False, summary_only=False)
+        enable_io_dump(dump_dir, with_values=True, with_metas=True)
         reset_exec_order()
         t = torch.zeros(2)
 
         # Step 0
         dump_before("test_op", (t,), {})
+        io_dumper._wait_and_flush()
         step0_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
         assert os.path.isdir(step0_dir)
         assert os.path.isfile(os.path.join(step0_dir, "call_1_input.pt"))
@@ -333,6 +349,7 @@ class TestIoDumpStep:
         # Step 1
         io_dump_step()
         dump_before("test_op", (t,), {})
+        io_dumper._wait_and_flush()
         step1_dir = os.path.join(dump_dir, "rank_0000", "step_0001", "test_op")
         assert os.path.isdir(step1_dir)
         assert os.path.isfile(os.path.join(step1_dir, "call_1_input.pt"))
@@ -394,7 +411,7 @@ class TestEnvVarInit:
         clear=False,
     )
     def test_env_basic(self):
-        io_dumper._init_from_env()
+        io_dumper.init_io_dump_from_env(True)
         assert is_dump_enabled()
         assert io_dumper._dump_dir == "/tmp/test_dump"
         assert io_dumper._match_all
@@ -408,7 +425,7 @@ class TestEnvVarInit:
         clear=False,
     )
     def test_env_ops(self):
-        io_dumper._init_from_env()
+        io_dumper.init_io_dump_from_env(True)
         assert io_dumper._op_filter == {"rms_norm", "silu_and_mul"}
         assert not io_dumper._match_all
 
@@ -421,7 +438,7 @@ class TestEnvVarInit:
         clear=False,
     )
     def test_env_modules(self):
-        io_dumper._init_from_env()
+        io_dumper.init_io_dump_from_env(True)
         assert io_dumper._module_filter == {"RMSNormFL"}
 
     @patch.dict(
@@ -433,7 +450,7 @@ class TestEnvVarInit:
         clear=False,
     )
     def test_env_max_calls(self):
-        io_dumper._init_from_env()
+        io_dumper.init_io_dump_from_env(True)
         assert io_dumper._max_calls == 10
 
     @patch.dict(
@@ -445,7 +462,7 @@ class TestEnvVarInit:
         clear=False,
     )
     def test_env_step_range(self):
-        io_dumper._init_from_env()
+        io_dumper.init_io_dump_from_env(True)
         assert io_dumper._step_range == (5, 15)
 
     @patch.dict(os.environ, {}, clear=False)
@@ -455,7 +472,7 @@ class TestEnvVarInit:
         os.environ.pop("VLLM_FL_IO_DUMP_MODULES", None)
         os.environ.pop("VLLM_FL_IO_DUMP_MAX_CALLS", None)
         os.environ.pop("VLLM_FL_IO_DUMP_STEP_RANGE", None)
-        io_dumper._init_from_env()
+        io_dumper.init_io_dump_from_env(True)
         assert not is_dump_enabled()
 
 
@@ -496,21 +513,21 @@ class TestShouldDumpTorchFunc:
         assert not _should_dump_torch_func("matmul")
 
     def test_enabled_all(self, dump_dir):
-        enable_io_dump(dump_dir, torch_funcs=True)
+        enable_io_dump(dump_dir, with_torch_funcs=True)
         assert _should_dump_torch_func("matmul")
         assert _should_dump_torch_func("softmax")
 
     def test_skips_dunder(self, dump_dir):
-        enable_io_dump(dump_dir, torch_funcs=True)
+        enable_io_dump(dump_dir, with_torch_funcs=True)
         assert not _should_dump_torch_func("__add__")
 
     def test_skips_trivial_ops(self, dump_dir):
-        enable_io_dump(dump_dir, torch_funcs=True)
+        enable_io_dump(dump_dir, with_torch_funcs=True)
         assert not _should_dump_torch_func("size")
         assert not _should_dump_torch_func("dim")
 
     def test_op_filter_match(self, dump_dir):
-        enable_io_dump(dump_dir, ops={"matmul"}, torch_funcs=True)
+        enable_io_dump(dump_dir, ops={"matmul"}, with_torch_funcs=True)
         assert _should_dump_torch_func("matmul")
         assert not _should_dump_torch_func("softmax")
 
@@ -541,13 +558,15 @@ class TestTorchDispatchMode:
     )
     def test_dispatch_mode_creates_files(self, dump_dir):
         """TorchDispatchMode should dump files when dump is enabled."""
-        enable_io_dump(
-            dump_dir, modules={"Linear"}, meta_only=False, summary_only=False
-        )
+        enable_io_dump(dump_dir, modules={"Linear"}, with_values=True, with_metas=True)
         model = torch.nn.Linear(4, 3)
 
         x = torch.randn(2, 4)
-        model(x)
+        push_module_context("Linear", model)
+        try:
+            model(x)
+        finally:
+            pop_module_context()
 
         # Step stays at 0 (step is advanced by model_runner.execute_model)
         step_dir = os.path.join(dump_dir, "rank_0000", "step_0000")
@@ -599,7 +618,7 @@ class TestDumpTorchFunctionMode:
         reason="TorchFunctionMode not available in this PyTorch version",
     )
     def test_torch_func_mode_activated(self, dump_dir):
-        enable_io_dump(dump_dir, torch_funcs=True)
+        enable_io_dump(dump_dir, with_torch_funcs=True)
         from vllm_fl.dispatch.io_common import func_mode_mgr
 
         assert func_mode_mgr.is_entered("dump")
@@ -609,7 +628,7 @@ class TestDumpTorchFunctionMode:
         reason="TorchFunctionMode not available in this PyTorch version",
     )
     def test_torch_func_mode_deactivated_on_disable(self, dump_dir):
-        enable_io_dump(dump_dir, torch_funcs=True)
+        enable_io_dump(dump_dir, with_torch_funcs=True)
         disable_io_dump()
         from vllm_fl.dispatch.io_common import func_mode_mgr
 
@@ -623,9 +642,9 @@ class TestDumpTorchFunctionMode:
         enable_io_dump(
             dump_dir,
             ops={"matmul"},
-            torch_funcs=True,
-            meta_only=False,
-            summary_only=False,
+            with_torch_funcs=True,
+            with_values=True,
+            with_metas=True,
         )
 
         a = torch.randn(2, 3)
@@ -657,7 +676,7 @@ class TestDumpTorchFunctionMode:
         reason="TorchFunctionMode not available in this PyTorch version",
     )
     def test_torch_func_mode_not_activated_when_disabled(self, dump_dir):
-        enable_io_dump(dump_dir, torch_funcs=False)
+        enable_io_dump(dump_dir, with_torch_funcs=False)
         from vllm_fl.dispatch.io_common import func_mode_mgr
 
         assert not func_mode_mgr.is_entered("dump")
@@ -668,7 +687,7 @@ class TestDumpTorchFunctionMode:
     )
     def test_no_infinite_recursion(self, dump_dir):
         """Ensure re-entrancy guard prevents infinite recursion."""
-        enable_io_dump(dump_dir, torch_funcs=True)
+        enable_io_dump(dump_dir, with_torch_funcs=True)
         a = torch.randn(3, 3)
         b = torch.randn(3, 3)
         result = torch.matmul(a, b)
@@ -685,12 +704,12 @@ class TestEnvVarTorchFuncs:
         os.environ,
         {
             "VLLM_FL_IO_DUMP": "/tmp/test_dump",
-            "VLLM_FL_IO_DUMP_TORCH_FUNCS": "1",
+            "VLLM_FL_IO_DUMP_WITH_TORCH_FUNCS": "1",
         },
         clear=False,
     )
     def test_env_torch_funcs_all(self):
-        io_dumper._init_from_env()
+        io_dumper.init_io_dump_from_env(True)
         assert io_dumper._torch_funcs_enabled
         assert io_dumper._torch_func_filter == set()
 
@@ -698,12 +717,12 @@ class TestEnvVarTorchFuncs:
         os.environ,
         {
             "VLLM_FL_IO_DUMP": "/tmp/test_dump",
-            "VLLM_FL_IO_DUMP_TORCH_FUNCS": "matmul,softmax",
+            "VLLM_FL_IO_DUMP_WITH_TORCH_FUNCS": "matmul,softmax",
         },
         clear=False,
     )
     def test_env_torch_funcs_specific(self):
-        io_dumper._init_from_env()
+        io_dumper.init_io_dump_from_env(True)
         assert io_dumper._torch_funcs_enabled
         assert io_dumper._torch_func_filter == {"matmul", "softmax"}
 
@@ -713,10 +732,10 @@ class TestEnvVarTorchFuncs:
         clear=False,
     )
     def test_env_torch_funcs_unset_match_all(self):
-        os.environ.pop("VLLM_FL_IO_DUMP_TORCH_FUNCS", None)
+        os.environ.pop("VLLM_FL_IO_DUMP_WITH_TORCH_FUNCS", None)
         os.environ.pop("VLLM_FL_IO_DUMP_OPS", None)
         os.environ.pop("VLLM_FL_IO_DUMP_MODULES", None)
-        io_dumper._init_from_env()
+        io_dumper.init_io_dump_from_env(True)
         # torch_funcs defaults to False (TorchDispatchMode handles ops)
         assert not io_dumper._torch_funcs_enabled
 
@@ -726,8 +745,8 @@ class TestEnvVarTorchFuncs:
         clear=False,
     )
     def test_env_torch_funcs_unset_filtered(self):
-        os.environ.pop("VLLM_FL_IO_DUMP_TORCH_FUNCS", None)
-        io_dumper._init_from_env()
+        os.environ.pop("VLLM_FL_IO_DUMP_WITH_TORCH_FUNCS", None)
+        io_dumper.init_io_dump_from_env(True)
         # torch_funcs defaults to False when specific ops are filtered
         assert not io_dumper._torch_funcs_enabled
 
@@ -756,36 +775,36 @@ class TestExecOrder:
         assert get_exec_order() == 0
 
     def test_dump_files_contain_exec_order(self, dump_dir):
-        enable_io_dump(dump_dir, summary_only=False)
+        enable_io_dump(dump_dir, with_metas=True)
         reset_exec_order()
         t = torch.zeros(2, 3)
         dump_before("op_a", (t,), {})
         dump_before("op_b", (t,), {})
+        io_dumper._wait_and_flush()
 
         # Check merged JSON files contain exec_order in metadata
         for op in ["op_a", "op_b"]:
             op_dir = os.path.join(dump_dir, "rank_0000", "step_0000", op)
             assert os.path.isfile(os.path.join(op_dir, "input.json"))
-            with open(os.path.join(op_dir, "input.json")) as f:
-                all_meta = json.load(f)
+            all_meta = _read_jsonl(os.path.join(op_dir, "input.json"))
             meta = all_meta["call_1"]
             assert "exec_order" in meta
 
     def test_dump_metadata_has_exec_order(self, dump_dir):
-        enable_io_dump(dump_dir, torch_funcs=False, summary_only=False)
+        enable_io_dump(dump_dir, with_torch_funcs=False, with_metas=True)
         t = torch.zeros(2)
         reset_exec_order()
         dump_before("test_op", (t,), {})
+        io_dumper._wait_and_flush()
 
         step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
         assert os.path.isfile(os.path.join(step_dir, "input.json"))
-        with open(os.path.join(step_dir, "input.json")) as f:
-            all_meta = json.load(f)
+        all_meta = _read_jsonl(os.path.join(step_dir, "input.json"))
         meta = all_meta["call_1"]
         assert meta["exec_order"] == 1
 
     def test_io_dump_step_resets_exec_order(self, dump_dir):
-        enable_io_dump(dump_dir, torch_funcs=False, summary_only=False)
+        enable_io_dump(dump_dir, with_torch_funcs=False, with_metas=True)
         t = torch.zeros(2)
         dump_before("test_op", (t,), {})
         assert get_exec_order() >= 1
@@ -813,7 +832,7 @@ io_dump:
     - Linear
   max_calls: 50
   step_range: "2-10"
-  torch_funcs: true
+  with_torch_funcs: true
 """
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write(cfg_content)
@@ -827,7 +846,7 @@ io_dump:
             assert dump_cfg["modules"] == {"Linear"}
             assert dump_cfg["max_calls"] == 50
             assert dump_cfg["step_range"] == (2, 11)
-            tf_enabled, tf_filter = dump_cfg["torch_funcs"]
+            tf_enabled, tf_filter = dump_cfg["with_torch_funcs"]
             assert tf_enabled is True
             assert tf_filter == set()
         finally:
@@ -841,7 +860,7 @@ io_dump:
         cfg_content = """
 io_dump:
   dir: /tmp/yaml_dump
-  torch_funcs:
+  with_torch_funcs:
     - matmul
     - softmax
 """
@@ -852,7 +871,7 @@ io_dump:
         try:
             result = parse_io_config_from_yaml(cfg_path)
             dump_cfg = result["io_dump"]
-            tf_enabled, tf_filter = dump_cfg["torch_funcs"]
+            tf_enabled, tf_filter = dump_cfg["with_torch_funcs"]
             assert tf_enabled is True
             assert tf_filter == {"matmul", "softmax"}
         finally:
@@ -874,7 +893,7 @@ io_dump:
         try:
             os.environ.pop("VLLM_FL_IO_DUMP", None)
             with patch.dict(os.environ, {"VLLM_FL_CONFIG": cfg_path}, clear=False):
-                io_dumper._init_from_env()
+                io_dumper.init_io_dump_from_env(True)
             assert is_dump_enabled()
             assert io_dumper._dump_dir == dump_dir
             assert io_dumper._op_filter == {"rms_norm"}
@@ -896,7 +915,7 @@ class TestDumpCleanup:
         reset_exec_order()
 
     def test_cleanup_pops_stale_pairing(self, dump_dir):
-        enable_io_dump(dump_dir, meta_only=False, summary_only=False)
+        enable_io_dump(dump_dir, with_values=True, with_metas=True)
         reset_exec_order()
         t = torch.zeros(2)
 
@@ -908,6 +927,7 @@ class TestDumpCleanup:
 
         # dump_after should now find no pairing and log a warning (not crash)
         dump_after("test_op", (t,), torch.ones(2))
+        io_dumper._wait_and_flush()
 
         # Only the input file should exist (no output file)
         step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
@@ -934,21 +954,21 @@ class TestExecOrderParam:
         reset_exec_order()
 
     def test_dump_before_uses_given_order(self, dump_dir):
-        enable_io_dump(dump_dir, meta_only=False, summary_only=False)
+        enable_io_dump(dump_dir, with_values=True, with_metas=True)
         t = torch.zeros(2)
 
         dump_before("test_op", (t,), {}, exec_order=99)
+        io_dumper._wait_and_flush()
 
         step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
         assert os.path.isfile(os.path.join(step_dir, "call_1_input.pt"))
 
-        with open(os.path.join(step_dir, "input.json")) as f:
-            all_meta = json.load(f)
+        all_meta = _read_jsonl(os.path.join(step_dir, "input.json"))
         meta = all_meta["call_1"]
         assert meta["exec_order"] == 99
 
     def test_dump_before_none_order_allocates_internally(self, dump_dir):
-        enable_io_dump(dump_dir, summary_only=False)
+        enable_io_dump(dump_dir, with_metas=True)
         reset_exec_order()
         t = torch.zeros(2)
 
@@ -975,7 +995,7 @@ class TestRankInDumper:
 
     def test_dump_creates_rank_directory(self, dump_dir):
         reset_rank()
-        enable_io_dump(dump_dir, summary_only=False)
+        enable_io_dump(dump_dir, with_metas=True)
         reset_exec_order()
         t = torch.zeros(2)
         dump_before("test_op", (t,), {})
@@ -986,7 +1006,7 @@ class TestRankInDumper:
     @patch.dict(os.environ, {"RANK": "3"}, clear=False)
     def test_dump_rank_nonzero(self, dump_dir):
         reset_rank()
-        enable_io_dump(dump_dir, summary_only=False)
+        enable_io_dump(dump_dir, with_metas=True)
         reset_exec_order()
         t = torch.zeros(2)
         dump_before("test_op", (t,), {})
@@ -998,28 +1018,28 @@ class TestRankInDumper:
 
     def test_dump_metadata_has_rank(self, dump_dir):
         reset_rank()
-        enable_io_dump(dump_dir, summary_only=False)
+        enable_io_dump(dump_dir, with_metas=True)
         reset_exec_order()
         t = torch.zeros(2)
         dump_before("test_op", (t,), {})
+        io_dumper._wait_and_flush()
 
         step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
-        with open(os.path.join(step_dir, "input.json")) as f:
-            all_meta = json.load(f)
+        all_meta = _read_jsonl(os.path.join(step_dir, "input.json"))
         meta = all_meta["call_1"]
         assert meta["rank"] == 0
 
     def test_output_metadata_has_rank(self, dump_dir):
         reset_rank()
-        enable_io_dump(dump_dir, summary_only=False)
+        enable_io_dump(dump_dir, with_metas=True)
         reset_exec_order()
         t = torch.zeros(2)
         dump_before("test_op", (t,), {})
         dump_after("test_op", (t,), torch.ones(2))
+        io_dumper._wait_and_flush()
 
         step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
-        with open(os.path.join(step_dir, "output.json")) as f:
-            all_meta = json.load(f)
+        all_meta = _read_jsonl(os.path.join(step_dir, "output.json"))
         meta = all_meta["call_1"]
         assert meta["rank"] == 0
 
@@ -1053,7 +1073,7 @@ class TestRankFilterInDumper:
 
     def test_rank_filter_allows_matching(self, dump_dir):
         reset_rank()  # rank 0
-        enable_io_dump(dump_dir, ranks={0}, summary_only=False)
+        enable_io_dump(dump_dir, ranks={0}, with_metas=True)
         reset_exec_order()
         t = torch.zeros(2)
         dump_before("test_op", (t,), {})
@@ -1068,7 +1088,7 @@ class TestRankFilterInDumper:
     )
     def test_env_rank_filter(self):
         reset_rank()
-        io_dumper._init_from_env()
+        io_dumper.init_io_dump_from_env(True)
         assert is_dump_enabled()
         assert io_dumper._rank_ok()
 
@@ -1079,7 +1099,7 @@ class TestRankFilterInDumper:
     )
     def test_env_rank_filter_blocks(self):
         reset_rank()
-        io_dumper._init_from_env()
+        io_dumper.init_io_dump_from_env(True)
         assert is_dump_enabled()
         assert not io_dumper._rank_ok()
 
@@ -1128,7 +1148,7 @@ io_dump:
         try:
             os.environ.pop("VLLM_FL_IO_DUMP", None)
             with patch.dict(os.environ, {"VLLM_FL_CONFIG": cfg_path}, clear=False):
-                io_dumper._init_from_env()
+                io_dumper.init_io_dump_from_env(True)
             assert is_dump_enabled()
             assert io_dumper._rank_ok()
         finally:
@@ -1174,8 +1194,8 @@ class TestStepSummary:
             reset_step()
 
 
-class TestMetaOnly:
-    """Test metadata-only dump mode."""
+class TestWithMetas:
+    """Test with_metas / with_values dump mode flags."""
 
     def setup_method(self):
         reset_step()
@@ -1186,13 +1206,14 @@ class TestMetaOnly:
         disable_io_dump()
         reset_exec_order()
 
-    def test_meta_only_creates_json_only(self, dump_dir):
-        """meta_only=True should create .json but not .pt files."""
-        enable_io_dump(dump_dir, meta_only=True, summary_only=False)
+    def test_with_metas_creates_json_only(self, dump_dir):
+        """with_values=False (default) creates .json but not .pt files."""
+        enable_io_dump(dump_dir, with_metas=True)
         reset_exec_order()
         t = torch.zeros(2, 3)
         dump_before("test_op", (t,), {})
         dump_after("test_op", (t,), t)
+        io_dumper._wait_and_flush()
 
         step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
         assert os.path.isdir(step_dir)
@@ -1203,72 +1224,74 @@ class TestMetaOnly:
         assert "input.json" in json_files
         assert "output.json" in json_files
 
-    def test_meta_only_json_has_tensor_stats(self, dump_dir):
-        """meta_only JSON should still have tensor stats via 'tensors' key."""
-        enable_io_dump(dump_dir, meta_only=True, summary_only=False)
+    def test_with_metas_json_has_tensor_stats(self, dump_dir):
+        """JSON (without .pt files) should still have tensor stats via 'tensors' key."""
+        enable_io_dump(dump_dir, with_metas=True)
         reset_exec_order()
         t = torch.randn(4, 5)
         dump_before("test_op", (t,), {})
+        io_dumper._wait_and_flush()
 
         step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
-        with open(os.path.join(step_dir, "input.json")) as f:
-            all_meta = json.load(f)
+        all_meta = _read_jsonl(os.path.join(step_dir, "input.json"))
         meta = all_meta["call_1"]
         assert "tensors" in meta
         assert "arg_0" in meta["tensors"]
         assert meta["tensors"]["arg_0"]["shape"] == [4, 5]
 
-    def test_meta_only_false_creates_pt(self, dump_dir):
-        """Explicit meta_only=False should create .pt files."""
-        enable_io_dump(dump_dir, meta_only=False, summary_only=False)
+    def test_with_values_creates_pt(self, dump_dir):
+        """with_values=True should create .pt files."""
+        enable_io_dump(dump_dir, with_values=True, with_metas=True)
         reset_exec_order()
         t = torch.zeros(2)
         dump_before("test_op", (t,), {})
+        io_dumper._wait_and_flush()
 
         step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
         assert os.path.isfile(os.path.join(step_dir, "call_1_input.pt"))
 
-    def test_meta_only_state(self, dump_dir):
-        enable_io_dump(dump_dir, meta_only=True)
-        assert io_dumper._meta_only is True
+    def test_with_metas_state(self, dump_dir):
+        enable_io_dump(dump_dir)
+        assert io_dumper._with_values is False
 
-    def test_meta_only_resets(self, dump_dir):
-        enable_io_dump(dump_dir, meta_only=True)
+    def test_with_values_resets(self, dump_dir):
+        enable_io_dump(dump_dir, with_values=True)
         disable_io_dump()
-        assert io_dumper._meta_only is True
-
-    @patch.dict(
-        os.environ,
-        {"VLLM_FL_IO_DUMP": "/tmp/test_dump", "VLLM_FL_IO_DUMP_META_ONLY": "1"},
-        clear=False,
-    )
-    def test_env_meta_only(self):
-        io_dumper._init_from_env()
-        assert io_dumper._meta_only is True
+        assert io_dumper._with_values is False
 
     @patch.dict(
         os.environ,
         {"VLLM_FL_IO_DUMP": "/tmp/test_dump"},
         clear=False,
     )
-    def test_env_meta_only_unset(self):
-        os.environ.pop("VLLM_FL_IO_DUMP_META_ONLY", None)
-        io_dumper._init_from_env()
-        assert io_dumper._meta_only is True  # default is now True
+    def test_env_with_values_default_false(self):
+        os.environ.pop("VLLM_FL_IO_DUMP_WITH_VALUES", None)
+        io_dumper.init_io_dump_from_env(True)
+        assert io_dumper._with_values is False
 
     @patch.dict(
         os.environ,
-        {"VLLM_FL_IO_DUMP": "/tmp/test_dump", "VLLM_FL_IO_DUMP_META_ONLY": "0"},
+        {"VLLM_FL_IO_DUMP": "/tmp/test_dump"},
         clear=False,
     )
-    def test_env_meta_only_disabled(self):
-        io_dumper._init_from_env()
-        assert io_dumper._meta_only is False
+    def test_env_with_values_unset(self):
+        os.environ.pop("VLLM_FL_IO_DUMP_WITH_VALUES", None)
+        io_dumper.init_io_dump_from_env(True)
+        assert io_dumper._with_values is False  # default is False
 
-    def test_default_meta_only_is_true(self, dump_dir):
-        """Default enable_io_dump() should have meta_only=True."""
+    @patch.dict(
+        os.environ,
+        {"VLLM_FL_IO_DUMP": "/tmp/test_dump", "VLLM_FL_IO_DUMP_WITH_VALUES": "1"},
+        clear=False,
+    )
+    def test_env_with_values_enabled(self):
+        io_dumper.init_io_dump_from_env(True)
+        assert io_dumper._with_values is True
+
+    def test_default_with_values_is_false(self, dump_dir):
+        """Default enable_io_dump() should have with_values=False."""
         enable_io_dump(dump_dir)
-        assert io_dumper._meta_only is True
+        assert io_dumper._with_values is False
 
 
 class TestLayerFilter:
@@ -1307,7 +1330,7 @@ class TestLayerFilter:
         clear=False,
     )
     def test_env_layer_filter(self):
-        io_dumper._init_from_env()
+        io_dumper.init_io_dump_from_env(True)
         assert io_dumper._layer_filter == {"model.layers.0"}
 
     @patch.dict(
@@ -1319,7 +1342,7 @@ class TestLayerFilter:
         clear=False,
     )
     def test_env_dump_layer_filter(self):
-        io_dumper._init_from_env()
+        io_dumper.init_io_dump_from_env(True)
         assert io_dumper._layer_filter == {"model.layers.0", "model.layers.1"}
 
     @pytest.mark.skipif(
@@ -1463,7 +1486,7 @@ class TestGlobLayerMatching:
     )
     def test_env_layer_expansion(self):
         """Env var layer specs should be expanded."""
-        io_dumper._init_from_env()
+        io_dumper.init_io_dump_from_env(True)
         assert "model.layers.0" in io_dumper._layer_filter
         assert "model.layers.1" in io_dumper._layer_filter
         assert "model.layers.2" in io_dumper._layer_filter
@@ -1657,7 +1680,7 @@ class TestSummaryJson:
 
 
 class TestSummaryOnly:
-    """Tests for summary_only mode."""
+    """Tests for summary (no per-op JSON) mode."""
 
     def setup_method(self):
         reset_exec_order()
@@ -1668,8 +1691,8 @@ class TestSummaryOnly:
         disable_io_dump()
 
     def test_summary_only_writes_summary(self, dump_dir):
-        """summary_only=True still writes summary.json."""
-        enable_io_dump(dump_dir=dump_dir, summary_only=True)
+        """Default mode (with_metas=False) still writes summary.json."""
+        enable_io_dump(dump_dir=dump_dir)
         t = torch.zeros(2)
         dump_before("test_op", (t,), {})
         dump_after("test_op", (t,), t)
@@ -1682,8 +1705,8 @@ class TestSummaryOnly:
         assert "test_op" in summary["non_flaggems_ops"]
 
     def test_summary_only_no_per_op_dirs(self, dump_dir):
-        """summary_only=True does NOT create per-op directories."""
-        enable_io_dump(dump_dir=dump_dir, summary_only=True)
+        """with_metas=False (default) does NOT create per-op directories."""
+        enable_io_dump(dump_dir=dump_dir)
         # Run ops through dispatch mode
         t = torch.zeros(2)
         _ = t + t  # triggers dispatch mode
@@ -1697,12 +1720,11 @@ class TestSummaryOnly:
             assert step_dirs == [], f"Expected no step dirs, found: {step_dirs}"
 
     def test_summary_only_env_var(self, dump_dir):
-        """VLLM_FL_IO_DUMP_SUMMARY_ONLY=1 enables summary_only mode."""
+        """Without VLLM_FL_IO_DUMP_WITH_METAS, with_metas defaults to False."""
         with patch.dict(
             os.environ,
             {
                 "VLLM_FL_IO_DUMP": dump_dir,
-                "VLLM_FL_IO_DUMP_SUMMARY_ONLY": "1",
             },
         ):
             from vllm_fl.dispatch.io_dumper import _init_from_env
@@ -1710,16 +1732,16 @@ class TestSummaryOnly:
             _init_from_env()
             from vllm_fl.dispatch import io_dumper
 
-            assert io_dumper._summary_only is True
+            assert io_dumper._with_metas is False
         disable_io_dump()
 
     def test_summary_only_dump_env_var(self, dump_dir):
-        """VLLM_FL_IO_DUMP_SUMMARY_ONLY=1 enables summary_only."""
+        """VLLM_FL_IO_DUMP_WITH_METAS=1 enables per-op JSON dumps."""
         with patch.dict(
             os.environ,
             {
                 "VLLM_FL_IO_DUMP": dump_dir,
-                "VLLM_FL_IO_DUMP_SUMMARY_ONLY": "1",
+                "VLLM_FL_IO_DUMP_WITH_METAS": "1",
             },
         ):
             from vllm_fl.dispatch.io_dumper import _init_from_env
@@ -1727,7 +1749,7 @@ class TestSummaryOnly:
             _init_from_env()
             from vllm_fl.dispatch import io_dumper
 
-            assert io_dumper._summary_only is True
+            assert io_dumper._with_metas is True
         disable_io_dump()
 
 
@@ -1744,7 +1766,7 @@ class TestJsonMergedWrite:
 
     def test_buffer_produces_correct_merged_output(self, dump_dir):
         """Multiple buffered writes produce correct merged JSON."""
-        enable_io_dump(dump_dir=dump_dir, meta_only=False, summary_only=False)
+        enable_io_dump(dump_dir=dump_dir, with_values=True, with_metas=True)
         t = torch.zeros(2)
         # Multiple calls to the same op
         dump_before("test_op", (t,), {})
@@ -1756,7 +1778,82 @@ class TestJsonMergedWrite:
         step_dir = os.path.join(dump_dir, "rank_0000", "step_0000", "test_op")
         input_json = os.path.join(step_dir, "input.json")
         assert os.path.isfile(input_json)
-        with open(input_json) as f:
-            data = json.load(f)
+        data = _read_jsonl(input_json)
         assert "call_1" in data
         assert "call_2" in data
+
+
+class TestInitIoDumpFromEnv:
+    """Test init_io_dump_from_env() public entry point."""
+
+    def teardown_method(self):
+        disable_io_dump()
+
+    @patch.dict(os.environ, {"VLLM_FL_IO_DUMP": "/tmp/test_init"}, clear=False)
+    def test_eager_true_enables_dump(self):
+        init_io_dump_from_env(True)
+        assert is_dump_enabled()
+
+    @patch.dict(os.environ, {"VLLM_FL_IO_DUMP": "/tmp/test_init"}, clear=False)
+    def test_eager_false_skips_dump(self):
+        """Graph mode: IO dumping silently skipped."""
+        init_io_dump_from_env(False)
+        assert not is_dump_enabled()
+
+    def test_no_env_vars_no_op(self):
+        for k in list(os.environ):
+            if k.startswith("VLLM_FL_IO_DUMP") or k == "VLLM_FL_CONFIG":
+                os.environ.pop(k)
+        init_io_dump_from_env(True)
+        assert not is_dump_enabled()
+
+    @patch.dict(os.environ, {"VLLM_FL_IO_DUMP": "/tmp/test_init"}, clear=False)
+    def test_idempotent(self):
+        """Calling twice should not raise or reset state."""
+        init_io_dump_from_env(True)
+        assert is_dump_enabled()
+        init_io_dump_from_env(True)
+        assert is_dump_enabled()
+
+
+class TestAdvanceIoStep:
+    """Test advance_io_step() public helper."""
+
+    def teardown_method(self):
+        disable_io_dump()
+
+    def test_no_op_when_disabled(self):
+        step_before = get_step()
+        advance_io_step()
+        assert get_step() == step_before
+
+    def test_advances_when_enabled(self, dump_dir):
+        enable_io_dump(dump_dir)
+        step_before = get_step()
+        advance_io_step()
+        assert get_step() == step_before + 1
+
+
+class TestRegisterIoModuleHooks:
+    """Test register_io_module_hooks() public helper."""
+
+    def teardown_method(self):
+        disable_io_dump()
+
+    def test_no_op_when_disabled(self):
+        """Should not install hooks when IO is not enabled."""
+        model = torch.nn.Linear(4, 4)
+        hooks_before = len(model._forward_pre_hooks) + len(model._forward_hooks)
+        register_io_module_hooks(model)
+        hooks_after = len(model._forward_pre_hooks) + len(model._forward_hooks)
+        assert hooks_before == hooks_after
+
+    def test_installs_hooks_when_enabled(self, dump_dir):
+        """Should install forward hooks on all modules when IO is enabled."""
+        model = torch.nn.Sequential(torch.nn.Linear(4, 4))
+        enable_io_dump(dump_dir)
+        register_io_module_hooks(model)
+        total_hooks = sum(
+            len(m._forward_pre_hooks) + len(m._forward_hooks) for m in model.modules()
+        )
+        assert total_hooks > 0
