@@ -502,6 +502,8 @@ def _get_executor() -> concurrent.futures.ThreadPoolExecutor:
 
 def _submit_bg(fn, *args, **kwargs) -> None:
     """Submit work to background executor; track future for later drain."""
+    if not _enabled:
+        return
     fut = _get_executor().submit(fn, *args, **kwargs)
     with _pending_lock:
         _pending_futures.append(fut)
@@ -638,7 +640,7 @@ def _wait_and_flush() -> None:
 
 
 def _dump_input(op_name: str, args: tuple, kwargs: dict,
-                exec_order: Optional[int] = None,
+                exec_order: int,
                 label: Optional[str] = None,
                 module_tag: str = "",
                 op_tag: str = "",
@@ -651,7 +653,7 @@ def _dump_input(op_name: str, args: tuple, kwargs: dict,
     """
     display = label or op_name
     try:
-        order = exec_order if exec_order is not None else next_exec_order()
+        order = exec_order
         call_num = _next_call_num(op_name)
         op_dir = _get_op_dir(op_name)
         os.makedirs(op_dir, exist_ok=True)
@@ -790,16 +792,17 @@ def dump_before(op_name: str, args: tuple, kwargs: dict,
     mod_path = get_current_module_path()
     _module_tag = make_module_tag_from_ctx(mod_name, mod_path, for_json=True)
     _op_tag = op_tag if op_tag is not None else make_op_tag(op_name)
+    # Allocate exec_order once so file metadata and print pairing share the same value.
+    order = exec_order if exec_order is not None else next_exec_order()
     record_seen(op_name, args)
     set_guard(True)
     try:
         # File dump (only if dump_dir is set)
         if _dump_dir:
-            _dump_input(op_name, args, kwargs, exec_order=exec_order, label=label,
+            _dump_input(op_name, args, kwargs, exec_order=order, label=label,
                         module_tag=_module_tag, op_tag=_op_tag)
         # Print: capture inputs for console logging in dump_after
         if _print_enabled:
-            order = exec_order if exec_order is not None else next_exec_order()
             input_lines = _format_inputs(args, kwargs, skip_module_arg=True)
             _push_print_pairing(op_name, label, order, input_lines, _op_tag)
     finally:
@@ -1095,12 +1098,15 @@ def enable_io_dump(
 
 def disable_io_dump() -> None:
     """Programmatically disable IO dumping and remove all hooks."""
+    # Deactivate dispatch/function modes first so no new ops enter the dump path.
+    _deactivate_hooks()
+    set_io_active(False)
+    # Drain all in-flight background tasks (no new submissions possible now).
     _wait_and_flush()
+    # Write summary before _reset_state clears _op_summary.
     _write_summary()
     _reset_state()
-    _deactivate_hooks()
     _clear_env_vars()
-    set_io_active(False)
 
 
 # ── Env-var propagation for child processes ──
@@ -1495,7 +1501,8 @@ def register_io_module_hooks(model: torch.nn.Module) -> None:
             lambda m, _args, cls=cls_name: push_module_context(cls, m)
         )
         h_post = module.register_forward_hook(
-            lambda _m, _args, _out: pop_module_context()
+            lambda _m, _args, _out: pop_module_context(),
+            always_call=True,
         )
         _module_hook_handles.append(h_pre)
         _module_hook_handles.append(h_post)
