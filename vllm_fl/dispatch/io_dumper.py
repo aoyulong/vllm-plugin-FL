@@ -627,12 +627,16 @@ def _close_open_files() -> None:
 
 
 def _wait_and_flush() -> None:
-    """Drain all background futures, then close open file handles."""
+    """Drain all background futures, log any exceptions, then close file handles."""
     with _pending_lock:
         pending = list(_pending_futures)
         _pending_futures.clear()
     if pending:
         concurrent.futures.wait(pending)
+        for fut in pending:
+            exc = fut.exception()
+            if exc is not None:
+                logger.warning("Background IO task failed: %s", exc, exc_info=exc)
     _close_open_files()
 
 
@@ -1098,9 +1102,13 @@ def enable_io_dump(
 
 def disable_io_dump() -> None:
     """Programmatically disable IO dumping and remove all hooks."""
-    # Deactivate dispatch/function modes first so no new ops enter the dump path.
-    _deactivate_hooks()
+    # Set _enabled=False first so handlers and _submit_bg stop accepting new work
+    # immediately, even if dispatch/function modes can't be exited right away due
+    # to LIFO constraints (they short-circuit on _enabled=False).
+    global _enabled
+    _enabled = False
     set_io_active(False)
+    _deactivate_hooks()
     # Drain all in-flight background tasks (no new submissions possible now).
     _wait_and_flush()
     # Write summary before _reset_state clears _op_summary.
