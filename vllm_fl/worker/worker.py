@@ -29,7 +29,6 @@ from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
 )
-# from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 try:
     from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 except ImportError:

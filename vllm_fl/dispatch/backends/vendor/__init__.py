@@ -22,6 +22,7 @@ __all__ = []
 # Import Ascend backend
 try:
     from .ascend import AscendBackend
+
     __all__.append("AscendBackend")
 except ImportError:
     pass
@@ -29,7 +30,16 @@ except ImportError:
 # Import CUDA backend
 try:
     from .cuda import CudaBackend
+
     __all__.append("CudaBackend")
+except ImportError:
+    pass
+
+# Import MACA backend
+try:
+    from .maca import MacaBackend
+
+    __all__.append("MacaBackend")
 except ImportError:
     pass
 

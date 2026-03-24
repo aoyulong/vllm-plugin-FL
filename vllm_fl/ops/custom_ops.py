@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 # note: cannot control inner gems op of UnquantizedFusedMoEMethodFL via env variable.
 OOT_OPS = {
     "silu_and_mul": (SiluAndMulFL, "SiluAndMul"),  # noqa F405
+    "gelu_and_mul": (GeluAndMulFL, "GeluAndMul"),  # noqa F405
     "rms_norm": (RMSNormFL, "RMSNorm"),  # noqa F405
     "rotary_embedding": (RotaryEmbeddingFL, "RotaryEmbedding"),  # noqa F405
     "fused_moe": (FusedMoEFL, "FusedMoE"),  # noqa F405

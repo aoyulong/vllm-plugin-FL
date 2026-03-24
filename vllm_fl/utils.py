@@ -71,6 +71,7 @@ def get_flag_gems_whitelist_blacklist() -> Tuple[
     # Priority 3: Blacklist from platform config
     try:
         from vllm_fl.dispatch.config import get_flagos_blacklist
+
         config_blacklist = get_flagos_blacklist()
         if config_blacklist:
             blacklist = config_blacklist
@@ -144,7 +145,7 @@ _load_op_config_from_env()
 class DeviceInfo:
     def __init__(self):
         self.device = DeviceDetector()
-        self.supported_device = ["nvidia", "ascend"]
+        self.supported_device = ["nvidia", "ascend", "metax"]
         backend.set_torch_backend_device_fn(self.device.vendor_name)
 
     @property
@@ -191,6 +192,7 @@ def get_flaggems_all_ops() -> list[str]:
 # OOT operator names as registered in custom_ops.py (op_name lowercase)
 OOT_OP_NAMES = [
     "silu_and_mul",
+    "gelu_and_mul",
     "rms_norm",
     "rotary_embedding",
     "fused_moe",
@@ -238,7 +240,10 @@ def get_oot_blacklist() -> Optional[list[str]]:
 
     # Priority 3: Blacklist from platform config
     try:
-        from vllm_fl.dispatch.config import get_oot_blacklist as config_get_oot_blacklist
+        from vllm_fl.dispatch.config import (
+            get_oot_blacklist as config_get_oot_blacklist,
+        )
+
         config_blacklist = config_get_oot_blacklist()
         if config_blacklist:
             return config_blacklist

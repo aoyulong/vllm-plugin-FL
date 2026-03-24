@@ -93,7 +93,7 @@ def register_model():
     try:
         ModelRegistry.register_model(
             "KimiK25ForConditionalGeneration",
-            "vllm_fl.models.kimi_k25:KimiK25ForConditionalGeneration"
+            "vllm_fl.models.kimi_k25:KimiK25ForConditionalGeneration",
         )
     except Exception as e:
         logger.error(f"Register KimiK25 model error: {str(e)}")
